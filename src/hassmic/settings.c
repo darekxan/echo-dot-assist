@@ -22,6 +22,7 @@
 #include "spkgain.h"
 #include "update.h"
 #include "wifimotion.h"
+#include "ultrasound_motion.h"
 #include "statefile.h"
 #include "buttons.h"
 #include <ctype.h>
@@ -107,7 +108,7 @@ static int colour_actual(void)
 /* ---------------------------------------------------------------- the table */
 
 enum id { WAKE_ENGINE, SPEECH_LANG, WAKE_ADAPT, MIC_LEVEL, DENOISE, WAKE_SOUND, SOUND_TOUCH, SOUND_MICS_OFF, SOUND_MICS_ON, SOUND_VOLUME, SOUND_BT_ON, SOUND_BT_OFF, WAKE_SOUND_REMOVAL, MUTE, DND, TIMER_RING, TIMER_SOUND, TIMER_STOP_ANY, TIMER_STOP_OTHERS, STOP_ENDS, MULTI_PRESS, WAKE_IN_REQ, END_REQ, BT_ANNOUNCE, BT_LANG, LED_AUTO, LED_LEVEL, RING_ROT, BAND, MUSIC_PAGE, SCR_AUTO, SCR_LEVEL, SCR_ADJUST, SCR_COLOUR, SCREEN_TEXT, SCREEN_HOLD, SCREEN_TIMERS, SCR_SLEEP, SCR_CLOCK, ARB, ARB_MODE, ARB_AUTO, ARB_WINDOW, ARB_OFFSET, SOUND, WHISPER, WAKE_EVENTS, REQUEST_TEXT, RING_LIVE, WIFI_MOTION,
-          WIFI_SENS, LIGHT_SENSOR, BT_PROXY, BT_AUDIO, BT_SPEAKER, BT_OUT_DELAY, BT_OUT_AWAKE, BT_OUT_STAY, DROPIN, DROPIN_ANSWER, CALL_MIC, UPDATES, HTTPS_VERIFY, KIOSK_NET, KIOSK_MIC, KIOSK_CAM, KIOSK_DLNA, SS_UNPAIRED, EQ_BASS, EQ_MID, EQ_TREBLE, SPK_GAIN, DUCK, DUCK_OTHERS, VOLUME, VOL_SPLIT,
+          WIFI_SENS, ULTRASOUND_MOTION, LIGHT_SENSOR, BT_PROXY, BT_AUDIO, BT_SPEAKER, BT_OUT_DELAY, BT_OUT_AWAKE, BT_OUT_STAY, DROPIN, DROPIN_ANSWER, CALL_MIC, UPDATES, HTTPS_VERIFY, KIOSK_NET, KIOSK_MIC, KIOSK_CAM, KIOSK_DLNA, SS_UNPAIRED, EQ_BASS, EQ_MID, EQ_TREBLE, SPK_GAIN, DUCK, DUCK_OTHERS, VOLUME, VOL_SPLIT,
           ASSIST_LINK, ASSIST_LEVEL, ASSIST_OFFSET, SOUNDS_LINK, SOUNDS_LEVEL, SOUNDS_OFFSET, TIMER_LINK, TIMER_LEVEL, TIMER_OFFSET,
           CALL_LINK, CALL_LEVEL, CALL_OFFSET,
           VOL_EVEN, NSET };
@@ -198,6 +199,7 @@ static const struct setting table[NSET] = {
     [RING_LIVE]   = { "ring_live", "Light ring live", "Features", NULL, S_BOOL, 0, 1, 1, 1 },
     [WIFI_MOTION] = { "wifi_motion", "Wi-Fi motion (experimental)", "Features", NULL, S_BOOL, 0, 1, 1, 1 },
     [WIFI_SENS]   = { "wifi_motion_sensitivity", "Wi-Fi motion sensitivity", "Features", NULL, S_INT, WIFIMOTION_SENS_MIN, WIFIMOTION_SENS_MAX, 1, 0 },
+    [ULTRASOUND_MOTION] = { "ultrasound_motion", "Ultrasound motion", "Features", NULL, S_BOOL, 0, 1, 1, 1 },
     [LIGHT_SENSOR] = { "light_sensor", "Light sensor", "Features", NULL, S_BOOL, 0, 1, 1, 1 },
     /* proto_esphome.c bt_proxy(): off, the device info names no proxy, so Home Assistant sets up no scanner, and
      * subscriptions and GATT requests are refused (issue #152).  Disabling the entities in Home Assistant leaves the
@@ -274,6 +276,7 @@ static int present(enum id i)
     case LIGHT_SENSOR: return core_lux() == core_lux();          /* a light sensor: not NAN */
     case LED_AUTO: return core_led_has_auto();
     case WIFI_MOTION: case WIFI_SENS: return wifimotion_present();
+    case ULTRASOUND_MOTION: return ultrasound_motion_present();
     case RING_LIVE: return ringlive_available();
     case ARB: case ARB_MODE: case ARB_AUTO: case ARB_WINDOW: case ARB_OFFSET: case DUCK_OTHERS: case TIMER_STOP_OTHERS: return arb_running();
     case DROPIN: case DROPIN_ANSWER: return dropin_running();
@@ -388,6 +391,7 @@ int settings_get(const struct setting *s)
     case SOUND: return core_sound(-1);
     case WIFI_MOTION: return wifimotion_enable(-1);
     case WIFI_SENS: return wifimotion_sensitivity(-1);
+    case ULTRASOUND_MOTION: return ultrasound_motion_enable(-1);
     case UPDATES: return update_channel(-1);
     case HTTPS_VERIFY: return https_verify(-1);
     case ARB: return arb_arbitrate(-1);
@@ -470,6 +474,7 @@ static void put(enum id i, int v)
     case SOUND: core_sound(v); break;
     case WIFI_MOTION: wifimotion_enable(v); break;
     case WIFI_SENS: wifimotion_sensitivity(v); break;
+    case ULTRASOUND_MOTION: ultrasound_motion_enable(v); break;
     case UPDATES: update_channel(v); break;
     case HTTPS_VERIFY: https_verify(v); break;
     case ARB: arb_arbitrate(v); break;                          /* arb.c keeps it */

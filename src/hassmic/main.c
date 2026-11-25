@@ -62,6 +62,7 @@
 #include "afemeta.h"
 #include "micend.h"
 #include "micgain.h"
+#include "ultrasound_motion.h"
 #include "wordtail.h"
 #include "wakealign.h"
 #include "netaddr.h"
@@ -1100,6 +1101,7 @@ static void on_whisper(int whispered, int confidence, int threshold)
 static void mute_update(int was, int sound)   /* lock held: ring, sound + Home Assistant follow the effective state */
 {
     int now = core_muted();
+    ultrasound_motion_mute(now);
     if (now == was) return;
     if (sound) sound_request(now ? SND_MICS_OFF : SND_MICS_ON);
     if (now) { if (state == LISTENING) core_pipeline_finish(); led("-s", "mics-off_on"); }
@@ -3788,6 +3790,10 @@ int main(int argc, char **argv)
 
     int ls = net_listen(core_port);
     if (ls < 0) { perror("listen"); return 1; }
+    pthread_mutex_lock(&core_lock);
+    ultrasound_motion_mute(core_muted());
+    pthread_mutex_unlock(&core_lock);
+    ultrasound_motion_start(NULL);
     static const struct netaddr_hooks na_hooks = { na_peers, sizeof na_peers / sizeof na_peers[0], na_announce };
     netaddr_start(&na_hooks);
     fprintf(stderr, "hassmic " VERSION " (" BUILD ") %s on %d, wake=%s\n", proto->id, core_port, core_local_wake ? "local" : "remote");
@@ -3810,6 +3816,7 @@ int main(int argc, char **argv)
             if (pthread_create(&t, NULL, serve_thread, (void *)(long)c)) { netaddr_link(c, 0); close(c); } else pthread_detach(t);
         } else { proto->serve(c); netaddr_link(c, 0); close(c); }
     }
+    ultrasound_motion_stop();
     cap_close();
     if (core_local_wake) wake_close(-1);
     ringlive_shutdown();                /* the live ring's frame dark, if it showed */

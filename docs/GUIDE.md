@@ -5,7 +5,7 @@ the [README](../README.md).
 
 - [Voice](#voice) · [Wake word](#wake-word) · [Several Echos](#several-echos)
 - [Buttons and light ring](#buttons-and-light-ring) · [Music](#music) · [Bluetooth proxy](#bluetooth-proxy)
-- [In Home Assistant](#in-home-assistant) · [Sound detection](#sound-detection) · [Whisper detection](#whisper-detection) · [Wi-Fi motion](#wi-fi-motion)
+- [In Home Assistant](#in-home-assistant) · [Sound detection](#sound-detection) · [Whisper detection](#whisper-detection) · [Wi-Fi motion](#wi-fi-motion) · [Ultrasound motion](#ultrasound-motion)
 - [Settings page](#settings-page) · [Setting up from a phone](#setting-up-from-a-phone) · [Factory reset](#factory-reset)
 - [hassmic.conf](#hassmicconf) · [adb over Wi-Fi](#adb-over-wi-fi) · [ESPHome or Wyoming](#esphome-or-wyoming)
 
@@ -822,6 +822,7 @@ Echo announces itself again after 100 s without Home Assistant, then less and le
 | Wake word events (off by default) | Wake word (event): `detected` (the Echo took it), `near_miss` (Amazon's engine heard something close, did not wake; none with microWakeWord), `answered_elsewhere` (another Echo or satellite answered), `no_speech` (woke, nothing said). A `detected` followed by `no_speech` is a false wake. Nothing while muted. Near misses can come often while the TV plays: an entry in Home Assistant's history each |
 | Request and reply text (off by default) | Last heard (what speech-to-text understood), Last reply (what the assistant answered). Both are cleared when a request starts, so the same request twice is still a change. Home Assistant takes at most 255 characters per state: a longer reply ends in "…". Every request and reply goes into Home Assistant's history while this is on. ESPHome only |
 | [Wi-Fi motion](#wi-fi-motion) | motion sensor, sensitivity |
+| [Ultrasound motion](#ultrasound-motion) | motion and presence sensors |
 | Light sensor (off by default) | Illuminance (the room's light in lux); "LED brightness" then also follows auto brightness, an entry in the logbook every few minutes. Off, it shows only levels you set |
 | [Bluetooth proxy](#bluetooth-proxy) (on by default) | no entities: Home Assistant's Bluetooth scanner for this Echo |
 | Bluetooth audio from phones | Bluetooth pairing |
@@ -958,6 +959,18 @@ change counts. Tried in one flat for a few minutes and one night, where it mostl
   Show 5), the module hooks the new one by itself (from the version of 2026-11-17 on, once the Echo restarted; not yet
   seen on an Echo); should no frame reach it for a minute, the sensor shows unknown and the log says why.
 - ESPHome only. It does not use the microphones; muting does not stop it.
+
+## Ultrasound motion
+
+Enable **Ultrasound motion** under **Features** on the Echo Dot 5 (Cannoli) to add two sensors to its ESPHome device
+in Home Assistant. The setting is off by default. Both sensors use the stock ultrasound detector locally on the Echo.
+
+- **Ultrasound motion** turns on for major movement such as someone walking by. It clears when major movement
+  ends and has been on for at least five seconds.
+- **Ultrasound presence** turns on for major or minor movement. It clears 30 seconds after the detector reports
+  neither level of movement. Someone sitting still long enough may go undetected.
+
+Both sensors report unknown while the microphones are muted or the detector is unavailable.
 
 ## Settings page
 
@@ -1151,7 +1164,7 @@ for 30 minutes:
 | Settings and sensors as entities | ✅ | ❌ |
 | Bluetooth from phones | ✅ pairing from Home Assistant | phones paired already |
 | Playing on a Bluetooth speaker | ✅ | keeps one already set up |
-| Bluetooth proxy, sound, whisper, Wi-Fi motion | ✅ | ❌ |
+| Bluetooth proxy, sound, whisper, Wi-Fi motion, ultrasound motion | ✅ | ❌ |
 | Encrypted link | ✅ key set by Home Assistant | ❌ plain TCP |
 | Online updates | ✅ | ❌ pushed from your PC only |
 | Settings page, setup from a phone, factory reset | ✅ | ✅ |

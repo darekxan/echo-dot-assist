@@ -94,6 +94,7 @@
 #include "clock.h"
 #include "update.h"
 #include "wifimotion.h"
+#include "ultrasound_motion.h"
 #include "net.h"
 #include "netio.h"
 #include "statefile.h"
@@ -157,7 +158,9 @@ enum { KEY_NOISE = 2, KEY_MIC_LEVEL, KEY_MULT, KEY_MUTE, KEY_WAKE_SOUND, KEY_SEN
        KEY_NEXT_TIMER, KEY_NEXT_TIMER_NAME, KEY_NEXT_TIMER_LENGTH, KEY_SCR_AUTO, KEY_SCR_LEVEL, KEY_SCR_ADJUST,
        /* the light ring live (ringlive.h): four actions, the design select, then a light per LED (RING_LEDS_MAX keys:
         * a new key goes after KEY_LIVE_LED + RING_LEDS_MAX) */
-       KEY_LIVE_FRAME, KEY_LIVE_ANIM, KEY_LIVE_DESIGN_SVC, KEY_LIVE_STOP, KEY_LIVE_DESIGN, KEY_LIVE_LED };
+       KEY_LIVE_FRAME, KEY_LIVE_ANIM, KEY_LIVE_DESIGN_SVC, KEY_LIVE_STOP, KEY_LIVE_DESIGN, KEY_LIVE_LED,
+       /* Keep the ultrasound key used by the original Cannoli deployment. */
+       KEY_ULTRASOUND_MOTION = KEY_LIVE_LED + RING_LEDS_MAX + 1, KEY_ULTRASOUND_PRESENCE };
 enum { MP_KEY = 1, MP_IDLE = 1, MP_PLAYING = 2, MP_CMD_STOP = 2, MP_CMD_MUTE = 3, MP_CMD_UNMUTE = 4 };
 #define MEDIA_RATE 48000        /* what we ask Home Assistant to transcode announcements and media to: WAV mono s16 */
 
@@ -420,6 +423,10 @@ static void send_setting(int key)       /* lock held */
     case KEY_WIFI_MOTION:               /* unknown while switched off */
         if (wifimotion_present()) { int m = wifimotion_motion(); pb_uint(&b, 2, m > 0); pb_uint(&b, 3, m < 0); send_state(BINARY_SENSOR_STATE, &b); }
         break;
+    case KEY_ULTRASOUND_MOTION: case KEY_ULTRASOUND_PRESENCE: {
+        int state = key == KEY_ULTRASOUND_MOTION ? ultrasound_motion_state() : ultrasound_presence_state();
+        pb_uint(&b, 2, state > 0); pb_uint(&b, 3, state < 0); send_state(BINARY_SENSOR_STATE, &b);
+    } break;
     case KEY_TIMER_RINGING: pb_uint(&b, 2, core_timers_ringing(NULL, 0) > 0); send_state(BINARY_SENSOR_STATE, &b); break;
     case KEY_TIMER_NAMES: { PB(t, 320); char names[288]; core_timers_ringing(names, sizeof names);
         pb_fixed32(&t, 1, key); pb_str(&t, 2, names); send_state(TEXT_SENSOR_STATE, &t); } break;
@@ -670,6 +677,8 @@ static int listed(int key)
     case KEY_ARB_SERVICE: return arb_running();     /* the network, which runs either way */
     case KEY_WHISPERED: return core_whisper_model() && settings_on("whisper_detection");
     case KEY_WIFI_MOTION: case KEY_WIFI_MOTION_SENS: return wifimotion_present() && settings_on("wifi_motion");
+    case KEY_ULTRASOUND_MOTION: case KEY_ULTRASOUND_PRESENCE:
+        return ultrasound_motion_present() && settings_on("ultrasound_motion");
     case KEY_LED_AUTO: return have_auto;
     case KEY_SCR_AUTO: case KEY_SCR_LEVEL: case KEY_SCR_ADJUST: return settings_find("screen_brightness_auto") != NULL;
     case KEY_LUX: return have_light && settings_on("light_sensor");
@@ -765,6 +774,14 @@ static void send_setting_entities(void)
           pb_str(&b, 3, "Wi-Fi motion sensitivity (experimental)"); pb_str(&b, 5, "mdi:tune");
           pb_float(&b, 6, WIFIMOTION_SENS_MIN); pb_float(&b, 7, WIFIMOTION_SENS_MAX); pb_float(&b, 8, 1); pb_uint(&b, 10, 1); pb_uint(&b, 12, 2);
           send_msg(LIST_NUMBER, &b); }
+    }
+    if (listed(KEY_ULTRASOUND_MOTION)) {
+        PB(b, 128); pb_str(&b, 1, "ultrasound_motion"); pb_fixed32(&b, 2, KEY_ULTRASOUND_MOTION);
+        pb_str(&b, 3, "Ultrasound motion"); pb_str(&b, 5, "motion"); send_msg(LIST_BINARY_SENSOR, &b);
+    }
+    if (listed(KEY_ULTRASOUND_PRESENCE)) {
+        PB(b, 128); pb_str(&b, 1, "ultrasound_presence"); pb_fixed32(&b, 2, KEY_ULTRASOUND_PRESENCE);
+        pb_str(&b, 3, "Ultrasound presence"); pb_str(&b, 5, "occupancy"); send_msg(LIST_BINARY_SENSOR, &b);
     }
     /* Timers: "binary_sensor.<node>_timer_ringing" still on a minute after it came on = nobody heard it, for an
      * automation that announces it elsewhere.  The names (or the length of a timer without one) are a diagnostic beside
@@ -1347,6 +1364,13 @@ static void bt_changed(void)
 }
 static void adb_changed(void) { pthread_mutex_lock(&core_lock); send_setting(KEY_ADB_WIFI); pthread_mutex_unlock(&core_lock); }
 static void wifi_changed(void) { pthread_mutex_lock(&core_lock); send_setting(KEY_WIFI_MOTION); pthread_mutex_unlock(&core_lock); }
+static void ultrasound_changed(void)
+{
+    pthread_mutex_lock(&core_lock);
+    send_setting(KEY_ULTRASOUND_MOTION);
+    send_setting(KEY_ULTRASOUND_PRESENCE);
+    pthread_mutex_unlock(&core_lock);
+}
 static void update_changed(void) { pthread_mutex_lock(&core_lock); send_setting(KEY_UPDATE); pthread_mutex_unlock(&core_lock); }
 
 static const struct ble_handler ble_handler = {
@@ -1747,6 +1771,7 @@ static void send_all_settings(void)
         send_setting(KEY_SS_UNPAIRED); send_setting(KEY_ADB_WIFI);
         send_setting(KEY_BT_OUT_SEARCH); send_setting(KEY_BT_OUT); send_setting(KEY_BT_OUT_STATUS); send_setting(KEY_BT_OUT_DELAY);
         for (int k = KEY_WIFI_MOTION_ON; k <= KEY_WIFI_MOTION_SENS; k++) send_setting(k);
+        send_setting(KEY_ULTRASOUND_MOTION); send_setting(KEY_ULTRASOUND_PRESENCE);
         send_setting(KEY_UPDATE); send_setting(KEY_WHISPERED);
         send_setting(KEY_TIMER_NAMES); send_setting(KEY_TIMER_RINGING);
         send_setting(KEY_NEXT_TIMER_NAME); send_setting(KEY_NEXT_TIMER_LENGTH); send_setting(KEY_NEXT_TIMER);
@@ -2014,6 +2039,7 @@ static void serve(int fd)
                                        pthread_t t;
                                        pthread_create(&t, NULL, light_thread, NULL); pthread_detach(t);
                                        adbwifi_start(adb_changed); wifimotion_start(wifi_changed); update_start(update_changed);
+                                       ultrasound_motion_start(ultrasound_changed);
                                        if (core_bluetooth(-1)) { ble_start(&ble_handler); a2dp_start(bt_changed); } } }
     for (int i = 0; i < MAX_CLIENTS; i++) { if (clients[i].fd < 0 && slot < 0) slot = i; n += clients[i].fd >= 0; }
     if (slot >= 0) { clients[slot].fd = fd; clients[slot].states = clients[slot].enc = clients[slot].keyed = clients[slot].ble = clients[slot].ble_free = clients[slot].ble_user = clients[slot].actions = clients[slot].ha_states = 0; if (!n) core_link(1, 0); }

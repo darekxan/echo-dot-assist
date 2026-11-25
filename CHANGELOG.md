@@ -2,6 +2,13 @@
 
 What changed for people using the Echo, newest first. Details and measurements are in [PLAN.md](PLAN.md).
 
+## 2026-11-25 — Ultrasound motion and presence on the Echo Dot 5
+
+- **Ultrasound motion** under **Features** adds two Home Assistant sensors for the Echo Dot 5 (Cannoli).
+  **Ultrasound motion** follows major movement such as a walk-by. **Ultrasound presence** also follows minor
+  movement and clears after 30 seconds without detected movement. Both use local detection and pause while
+  the microphones are muted.
+
 ## 2026-11-18 — The language you speak, from the right time zone
 
 - **A Portuguese "Alexa" in Brazil finds where the wake word ends by its sounds again.** Since more languages came to

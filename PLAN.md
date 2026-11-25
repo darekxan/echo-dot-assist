@@ -1909,7 +1909,7 @@ Run in this order. Each step says what it proves.
       up, puffin stopped. Setup's unlock step now takes an Echo already unlocked (Fire OS on adb: stock has none) to
       TWRP with `adb reboot recovery` instead of asking for the unlock (biscuit: "unlocked already", TWRP up; donut's
       kamakiri and radar's amonet also leave TWRP on the recovery partition). Not tried: donut and radar first installs.
-- [x] Ultrasound motion sensing (2026-10-01): tried, not possible with any of these Echos. donut's mics can: the two
+- [x] Ultrasound probe on donut, biscuit and radar (2026-10-01). Donut's mics can capture ultrasound. The two
       TLV320AIC3101 on TDM in (`TDM_Capture`, card 0 dev 1, 4 ch S32; mixer opens it at 16 kHz) record at 48 and 96 kHz
       with `tinycap` once `mixer` is stopped, and keys jingled over the Echo raise every band by ~40 dB up to 45 kHz. The
       speaker cannot: a 2-23.8 kHz sweep at -24 dBFS on DL1 (pcm6p, which feeds both the TAS2770 and the line out)
@@ -1923,6 +1923,17 @@ Run in this order. Each step says what it proves.
       `*Uspd.tflite` models, no ultrasound section in AFE.cfg. A `mixer` record stream `ultraSound` exists (reports
       2000 Hz x 9 ch x 32 bit) but the HAL refuses it (`Could not open input stream -22`), and **mixer retries every 10 ms
       for ever after the client has gone** (35 % CPU, logd 18 %) until `stop mixer; start mixer`: do not open it.
+- [x] Cannoli ultrasound motion (2026-11-25). The stock CanCheese detector publishes
+      `notify_ultrasound_event` on `com.doppler.lasp`. HassMic subscribes locally without PuffinApp or a capture stream.
+      Native major movement drives the ESPHome motion sensor. Native clear ends the indication after a five-second
+      minimum. Mute and source loss publish unknown. HassMic records the mode it enables so it can release it
+      after a restart, and shares an already enabled mode. Tested with the stock firmware and ESPHome on an
+      Echo Dot 5. Home Assistant showed idle off and the owner confirmed a walk-by detection. The focused unit
+      suite covers status parsing, clear, mute, subscription restart and mode ownership.
+- [~] Cannoli ultrasound presence (2026-11-25). A second ESPHome binary sensor infers room occupancy from either
+      stock movement level. The sensor clears 30 seconds after the detector reports neither movement level and
+      reports unknown on mute or source loss. Still occupants may go undetected. Physical verification of the
+      presence sensor is pending.
 - [x] Wi-Fi motion's hook lost with the driver (2026-11-13): an Echo Show 5 showed the sensor unknown for 37 h with
       `hassmic_rcpi4m` loaded: `/proc/hassmic_rcpi4m` AGE 134762780 ms, FRAMES frozen at 75444, and `wlan_mt76x8_sdio`
       newer than our module in `/proc/modules`: there Android's Wi-Fi HAL rmmods and insmods the driver on Wi-Fi off/on
