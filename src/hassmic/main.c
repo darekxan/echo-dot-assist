@@ -62,6 +62,9 @@
 #include "afemeta.h"
 #include "micend.h"
 #include "micgain.h"
+#include "realtime.h"
+#include "realtime_config.h"
+#include "realtime_echo.h"
 #include "wordtail.h"
 #include "wakealign.h"
 #include "netaddr.h"
@@ -228,6 +231,13 @@ static int arb_port = 28930;                        /* 0 = no wake word arbitrat
 static int dropin_port = 28932;                     /* 0 = no Drop In (needs the arbitration network) */
 int core_web_port = 28931;                           /* 0 = no settings page */
 int core_duplex;
+static atomic_uint realtime_run;        /* local voice session, separate from the ESPHome connection */
+static unsigned realtime_sequence;
+static int dropin_was;                  /* core_lock held */
+static int realtime_reply, realtime_heard, realtime_cutting;   /* core_lock, completed by the playback worker */
+static void realtime_output_cut(unsigned run);
+
+int core_realtime_active(void) { return atomic_load(&realtime_run) != 0; }
 int core_local_wake = 1, core_port, core_sendspin_port = 28928;       /* 0 = Sendspin off */
 static const struct proto *proto = &proto_esphome;
 
@@ -253,6 +263,7 @@ static int soft_mute;                               /* under lock: mute switch f
 static int dnd;                                     /* under lock: do not disturb */
 static int barge_in;                                /* under lock: start a new pipeline once the current one has ended
                                                       * (wake word during a reply, or the server asked to continue the conversation) */
+static int barge_slot = -1;                        /* under lock: a cut leading to another local wake or button */
 static uint64_t barge_from;                         /* under lock: where that wake word ended (ring samples), 0: no wake word */
 static uint64_t replay_from;                        /* under lock: the pipeline just started from a wake word that ended
                                                       * here; the capture thread sends the ring from the end of the word's
@@ -759,7 +770,23 @@ static int wake_cut;
 static int wake_fails;                              /* lock held: wake word runs Home Assistant failed during this reply */
 static int follow_up;                               /* lock held: the pipeline now starting is a follow-up to a question */
 static void whisper_run(void);
-static void pipeline_start(uint64_t from)    /* from: where the wake word that starts it ended, 0: not a wake word */
+static int error_shows(void);
+int core_realtime_supported(void)
+{
+    return proto == &proto_esphome && core_local_wake;
+}
+
+int core_realtime_voip_supported(void)
+{
+    return core_realtime_supported() && realtime_voip_supported();
+}
+
+static int native_slot(unsigned slot)
+{
+    return core_realtime_supported() && realtime_available(slot);
+}
+
+static void pipeline_start(uint64_t from, int slot)    /* slot: local wake slot, or -1 for an Assist-initiated run */
 {
     run_over = 0; wake_wait = 0;
     quiet_abort = 0;
@@ -771,11 +798,28 @@ static void pipeline_start(uint64_t from)    /* from: where the wake word that s
      * end ended this one before any audio went out (heard_end in the capture thread) */
     micend_start(&mic_end, MICEND_OFF, 0, 0, NULL);
     run_wake = from != 0;
-    whisper_run();
-    proto->start();
+    if (from && slot >= 0 && slot < n_act)
+        snprintf(wake_phrase, sizeof wake_phrase, "%s", wake_words[wake_act[slot]].name);
+    unsigned run = 0;
+    if (slot >= 0 && native_slot((unsigned)slot)) {
+        if (!++realtime_sequence) ++realtime_sequence;
+        if (realtime_start((unsigned)slot, realtime_sequence, dropin_was == DROPIN_IDLE)) {
+            run = realtime_sequence;
+            realtime_reply = realtime_heard = realtime_cutting = 0;
+            atomic_store(&realtime_run, run);
+        }
+    }
+    if (!run) {
+        if (!connected || !satellite_running) {
+            if (error_shows()) led("-s", "anim_start_error_short");
+            return;
+        }
+        whisper_run();
+        proto->start();
+    }
     atomic_store(&streaming, 1);
     int listen_now = core_local_wake || follow_up;      /* remote wake: a follow-up has no wake word to wait for */
-    if (listen_now) lead_in();                 /* ahead of the capture thread's first block: it needs the lock */
+    if (listen_now && !run) lead_in();                 /* ahead of the capture thread's first block: it needs the lock */
     listening(listen_now);
     if (listen_now) core_set_state(LISTENING);
 }
@@ -833,7 +877,7 @@ static void wake_listen(void)
 {
     if (core_local_wake || !run_over || state != SPEAKING || atomic_load(&streaming) || atomic_load(&flush_playback) ||
         wake_fails >= WAKE_FAILS_MAX || !connected || !satellite_running) return;
-    pipeline_start(0);
+    pipeline_start(0, -1);
     wake_wait = 1;
 }
 
@@ -933,7 +977,6 @@ int core_muted(void) { return soft_mute || buttons_muted(); }
 static atomic_int dropin_ring = -1;                 /* the earcon thread loops this ringtone (SND_RING_*), -1: none */
 static atomic_llong dropin_ring_at;                 /* ... from then on (mono_ms) */
 static atomic_int dropin_live;
-static int dropin_was;                              /* lock held */
 static const char *const dropin_led[4] = { NULL, "call_outbound_ringing", "call_incoming", "call_connected" };
 static void mix_apply(void);
 
@@ -943,6 +986,11 @@ void core_dropin(int st, const char *peer, int outgoing)
     int was = dropin_was;
     dropin_was = st;
     if (st != was) {
+        unsigned run = atomic_load(&realtime_run);
+        if (st != DROPIN_IDLE && run) {
+            if (realtime_wants_voip(run)) core_pipeline_finish();
+            else realtime_stop_hfp(run);       /* free the call microphone for Drop In */
+        }
         fprintf(stderr, "drop in: %s%s%s\n", dropin_states[st], peer[0] ? " " : "", peer);
         if (dropin_led[was]) led("-u", dropin_led[was]);
         if (dropin_led[st]) led("-s", dropin_led[st]);
@@ -1102,7 +1150,10 @@ static void mute_update(int was, int sound)   /* lock held: ring, sound + Home A
     int now = core_muted();
     if (now == was) return;
     if (sound) sound_request(now ? SND_MICS_OFF : SND_MICS_ON);
-    if (now) { if (state == LISTENING) core_pipeline_finish(); led("-s", "mics-off_on"); }
+    if (now) {
+        if (state == LISTENING || core_realtime_active()) core_pipeline_finish();
+        led("-s", "mics-off_on");
+    }
     else { led("-u", "mics-off_on"); led("-s", "mics-off_end"); }
     if (connected && proto->mute_changed) proto->mute_changed(now);
 }
@@ -1162,12 +1213,18 @@ static void heard_end(void)
 }
 
 int core_follow_up(void) { return follow_up; }
-void core_restart_after(void) { barge_in = 1; barge_from = 0; }
+void core_restart_after(void) { barge_in = 1; barge_from = 0; barge_slot = -1; }
 
 void core_pipeline_finish(void)
 {
     wake_fails = 0;
-    if (atomic_exchange(&streaming, 0) && connected) {
+    unsigned run = atomic_exchange(&realtime_run, 0);
+    int was_streaming = atomic_exchange(&streaming, 0);
+    if (run) {
+        realtime_stop(run);
+        realtime_output_cut(run);
+        realtime_reply = 0;
+    } else if (was_streaming && connected) {
         /* a run that only listened for the wake word is aborted, not ended: a stale error from it must not reach the next */
         if (wake_wait && proto->cancel) proto->cancel();
         else if (proto->stop) proto->stop();
@@ -1181,8 +1238,9 @@ void core_pipeline_finish(void)
         if (barge_in) sound_request(SND_WAKE);
         uint64_t from = barge_in ? barge_from : 0;      /* what was said after the wake word while the reply was cut */
         follow_up = barge_in && !core_local_wake;
-        barge_in = 0; barge_from = 0;
-        pipeline_start(from);
+        int slot = barge_in ? barge_slot : -1;
+        barge_in = 0; barge_from = 0; barge_slot = -1;
+        pipeline_start(from, slot);
         follow_up = 0;
     }
 }
@@ -1192,8 +1250,8 @@ void core_link(int up, int ready)
     int was = satellite_running;
     connected = up; satellite_running = up && ready; link_paused = 0;
     if (satellite_running) adopted();
-    if (!satellite_running) core_pipeline_finish();
-    else if (!was && !core_local_wake && state == IDLE) pipeline_start(0);
+    if (!satellite_running && !core_realtime_active()) core_pipeline_finish();
+    else if (!was && !core_local_wake && state == IDLE) pipeline_start(0, -1);
 }
 
 /* Wyoming's pause-satellite: what Home Assistant's mute switch sends, and the link stays open.  Linked and not running
@@ -1253,7 +1311,7 @@ static int error_shows(void)
 }
 
 /* touch: the action button rather than the wake word.  from: where the wake word ended on the ring's clock (0: unknown) */
-static void trigger(int touch, uint64_t from)
+static void trigger(int touch, uint64_t from, int slot)
 {
     pthread_mutex_lock(&core_lock);
     /* A ringing timer stops only when told to: the button, "<wake word>, stop" (stop_word, core_transcript), Home
@@ -1262,6 +1320,12 @@ static void trigger(int touch, uint64_t from)
     if (touch && atomic_load(&alarm_on)) {
         core_alarm_stop("button");
         wake_cut_ms = mono_ms();
+    } else if (core_realtime_active()) {
+        if (touch || core_muted()) core_pipeline_finish();
+        else if (stopped_now()) {
+            if (state == SPEAKING) realtime_interrupt(atomic_load(&realtime_run));
+            else core_pipeline_finish();
+        }
     } else if ((state == THINKING || (touch && state == LISTENING)) && connected && proto->cancel) {
         /* As the center button of a Voice PE: a misheard command is stopped before its tool calls run, not only its
          * reply.  Same message as ESPHome's voice_assistant.stop; Home Assistant cancels the run's task (the LLM, and
@@ -1273,9 +1337,10 @@ static void trigger(int touch, uint64_t from)
         else if (!touch && state == IDLE && satellite_running && !core_muted()) {
             wake_cut_ms = mono_ms();
             sound_request(SND_WAKE);
-            pipeline_start(from);
+            pipeline_start(from, core_local_wake ? slot : -1);
         }
-    } else if (!connected || !satellite_running || core_muted()) {
+    } else if (core_muted() ||
+               (!(connected && satellite_running) && !native_slot((unsigned)slot))) {
         /* Nothing to talk to, or privacy latch on.  Without Home Assistant the Echo used to do nothing at all here: no
          * sound, no ring, no log line, so "it does not listen" during an HA restart or a lost link looked like a deaf
          * Echo and left nothing to find afterwards.  Unlike nothing said (core_no_speech, issue #48) something did fail
@@ -1292,7 +1357,7 @@ static void trigger(int touch, uint64_t from)
         if (atomic_load(&alarm_on) || dropin_was != DROPIN_IDLE) wake_cut_ms = mono_ms();     /* its "stop" drops this pipeline again */
         if (touch) wake_phrase[0] = 0;                          /* the button: the first wake word's assistant */
         sound_request(touch ? SND_TOUCH : SND_WAKE);
-        pipeline_start(touch ? 0 : from);
+        pipeline_start(touch ? 0 : from, slot);
     } else if (state == SPEAKING && !touch && stopped_now()) {
         /* its "stop" came during the round to a THINKING run whose reply began before the round ended: the reply is
          * cut as stop_word would have cut it, and no run follows */
@@ -1308,7 +1373,7 @@ static void trigger(int touch, uint64_t from)
                                                                              * say that: continue-conversation sets it too */
         fprintf(stderr, "barge-in\n");
         wake_cut_ms = mono_ms();
-        barge_in = 1; barge_from = from;
+        barge_in = 1; barge_from = from; barge_slot = slot;
         atomic_store(&flush_playback, 1);   /* playback thread drops TTS up to audio-stop, then we restart */
     }
     pthread_mutex_unlock(&core_lock);
@@ -1374,7 +1439,10 @@ static void stop_word(void)
         fprintf(stderr, "stop: reply cut\n");
         barge_in = 0;
         atomic_fetch_and(&sounds_pending, ~(1 << SND_WAKE | 1 << SND_TOUCH));
-        atomic_store(&flush_playback, 1);
+        if (core_realtime_active()) realtime_interrupt(atomic_load(&realtime_run));
+        else atomic_store(&flush_playback, 1);
+    } else if (core_realtime_active() && (state == THINKING || (stop_ends && stop_heard()))) {
+        core_pipeline_finish();
     } else if (state == LISTENING && (told || mono_ms() - wake_cut_ms < 4000)) {     /* told: the run this wake word opened */
         fprintf(stderr, "stop: pipeline dropped\n");
         stop_cut = 1;                       /* a wake word whose round still runs (heard while this listened) opens none */
@@ -1436,7 +1504,9 @@ static int16_t ring[RING_SAMPLES];                  /* what the wake word engine
 static uint64_t ring_n;                             /* capture thread: samples fed so far */
 static atomic_int det_pending;                      /* a detection for the capture thread; det_begin/end under core_lock */
 static uint64_t det_begin, det_end;
+static int det_slot;
 static long long arb_due;                           /* capture thread: a round runs, decide then */
+static int arb_slot;                              /* capture thread: preserve the winning wake slot */
 static uint64_t arb_from;                           /* capture thread: where the wake word of the round ended */
 
 static void ring_put(const int16_t *s, size_t n)
@@ -1538,7 +1608,7 @@ static atomic_int afe_busy;                         /* a reading runs (afe_threa
 static atomic_int afe_got;                          /* its score; INT_MIN: none */
 static long afe_ts, afe_te;                         /* the keyword's place on the front end's clock, set before it starts */
 static long long score_due;                         /* capture thread: the claim waits for the reading until then */
-static struct { uint64_t end; int own, prio; char kw[64]; } pend;   /* capture thread: the wake word that waits */
+static struct { uint64_t end; int own, prio, slot; char kw[64]; } pend;   /* capture thread: the wake word that waits */
 static int afe_late;                                /* capture thread: a reading was left behind */
 
 static void *afe_thread(void *arg)
@@ -1622,7 +1692,8 @@ static void send_out(const int16_t *pcm, size_t n, int sound)
     static int16_t out[1024 + MICDENOISE_FRAME];
     /* -D: the reply is our own sound too.  The echo canceller leaves a trace of it that the gain would bring up to
      * speech level (up to +36 dB), and the client would answer it as the talker */
-    mic_gain.hold = sound || (core_duplex && atomic_load(&tts_on));
+    unsigned run = atomic_load(&realtime_run);
+    mic_gain.hold = sound || ((core_duplex || run) && atomic_load(&tts_on));
     micend_run(&mic_end, pcm, n, mic_gain.hold);        /* the level as heard, before the gain; heard_end() acts on it */
     while (n) {
         size_t k = n < 1024 ? n : 1024, m = k;
@@ -1635,7 +1706,10 @@ static void send_out(const int16_t *pcm, size_t n, int sound)
             denoise_ns += (t1.tv_sec - t0.tv_sec) * 1000000000LL + t1.tv_nsec - t0.tv_nsec; denoise_frames += m / MICDENOISE_FRAME;
         }
         if (m) {
-            micgain_run(&mic_gain, src, out, m); proto->audio(out, m * 2);
+            micgain_run(&mic_gain, src, out, m);
+            if (run) {
+                if (!core_muted()) realtime_audio(run, out, m);
+            } else proto->audio(out, m * 2);
             double e = 0; for (size_t i = 0; i < m; i++) e += (double)out[i] * out[i];   /* the band's listening bar */
             int db10 = e > 0 ? (int)lround(100 * log10(e / m / (32768.0 * 32768.0))) : -1000;
             ring_level(db10); screen_level(db10);
@@ -1663,7 +1737,8 @@ static void send_mic(const int16_t *pcm, size_t n, uint64_t at)
         static const int denoise_db[] = { 0, 6, 9, 12 };
         fprintf(stderr, "mic gain: talker %.1f dBFS, gain %+.1f dB", micgain_talker_db(&mic_gain), mic_gain.gain_db);
         if (mic_denoise) fprintf(stderr, ", noise reduction %d dB", denoise_db[mic_denoise]);
-        micend_start(&mic_end, proto->end ? end_mode : MICEND_OFF, micgain_talker_db(&mic_gain), at, ring_speech);
+        micend_start(&mic_end, proto->end && !core_realtime_active() ? end_mode : MICEND_OFF,
+                     micgain_talker_db(&mic_gain), at, ring_speech);
         if (talker_from > at) mic_end.from = talker_from;   /* the wake word sent too: not the request's speech yet */
         mic_gain.talker_min_db = mic_end.mode ? mic_end.talker_db - micend_margin(mic_end.mode) : -1000;   /* nor the gain's */
         if (mic_end.mode) fprintf(stderr, ", end heard here: %s", micend_names[mic_end.mode]);
@@ -1681,8 +1756,11 @@ static void send_mic(const int16_t *pcm, size_t n, uint64_t at)
     }
     while (n) {
         size_t k = n < 1024 ? n : 1024, m;
+        int16_t filtered[1024];
+        unsigned run = atomic_load(&realtime_run);
+        const int16_t *input = run && realtime_echo_capture(run, at, pcm, filtered, k) ? filtered : pcm;
         const int16_t *p; int held_sound;
-        m = earsup_run(pcm, k, at, &p, &held_sound);
+        m = earsup_run(input, k, at, &p, &held_sound);
         if (m) send_out(p, m, held_sound || sound_in(at, m));
         pcm += k; n -= k; at += k;
     }
@@ -1966,14 +2044,14 @@ static int64_t word_tail_end(uint64_t end, uint64_t to)
     return (int64_t)(end + (uint64_t)cut * WORDTAIL_FRAME);
 }
 
-static void answer(uint64_t from, int round)        /* capture thread: act on the wake word that ended at from */
+static void answer(uint64_t from, int round, int slot)        /* capture thread: act on the wake word that ended at from */
 {
     duck_won(round);                                /* round: we won one, its losers wait for our "on" (duck.c) */
-    trigger(0, from);
+    trigger(0, from, slot);
     if (!atomic_load(&streaming)) afe_done();          /* it stopped a ring, or cut a reply: the pipeline's end follows */
 }
 
-static void claim(const char *kw, int score, int prio, uint64_t end)   /* capture thread */
+static void claim(const char *kw, int score, int prio, uint64_t end, int slot)   /* capture thread */
 {
     /* The other Echos' claims are Wi-Fi broadcasts, and the BLE scan's share of the antenna loses them (ble.c): no
      * scanning while this round listens: the wait it took (none when nobody was worth waiting for, arb.c "Rivals"),
@@ -1981,32 +2059,39 @@ static void claim(const char *kw, int score, int prio, uint64_t end)   /* captur
      * claim: its first copy is out before the scan stops anyway, the other two 30 and 80 ms on */
     long long due = arb_claim(kw, score, prio), w = due ? due - mono_ms() : 0;
     ble_quiet(w + 500 > 1000 ? (int)w + 500 : 1000);
-    if (!due) { answer(end, 0); return; }
+    if (!due) { answer(end, 0, slot); return; }
     duck_round(due);                                /* won or lost, the music goes down from the wake word (duck.c) */
-    arb_due = due; arb_from = end;
+    arb_due = due; arb_from = end; arb_slot = slot;
 }
 
-static void wake_heard(uint64_t begin, uint64_t end, int simulated)     /* capture thread */
+static void wake_heard(uint64_t begin, uint64_t end, int simulated, int slot)     /* capture thread */
 {
-    if (!arb_running()) { trigger(0, end); return; }
+    if (!arb_running()) { trigger(0, end, slot); return; }
     if (arb_due || score_due) return;               /* the same wake word once more while its round runs */
     pthread_mutex_lock(&core_lock);
-    int alarm = atomic_load(&alarm_on), can = alarm || (connected && satellite_running && !core_muted()), prio = alarm || state != IDLE ? 2 : 0;
+    int alarm = atomic_load(&alarm_on), prio = alarm || state != IDLE ? 2 : 0;
+    int can = alarm || (!core_muted() && ((connected && satellite_running) || native_slot((unsigned)slot)));
     pthread_mutex_unlock(&core_lock);
-    if (!can) { trigger(0, end); return; }               /* could not answer: a claim would only silence the Echos that can */
+    if (!can) { trigger(0, end, slot); return; }               /* could not answer: a claim would only silence the Echos that can */
     /* the one heard: with two wake words, Echos compete per wake word as they do with one each */
-    pthread_mutex_lock(&core_lock); char kw[64]; wake_phrase_bare(kw, sizeof kw); pthread_mutex_unlock(&core_lock);
+    char kw[64];
+    pthread_mutex_lock(&core_lock);
+    if (slot >= 0 && slot < n_act && n_wake_words) {
+        int i = wake_act[slot];
+        snprintf(kw, sizeof kw, "%.*s", (int)wake_bare_len[i], wake_words[i].name);
+    } else wake_phrase_bare(kw, sizeof kw);
+    pthread_mutex_unlock(&core_lock);
     /* Kiosk Satellite mode: their loudness, not the front end's energies (whose time only the window would pay for) */
     if (arb_mode(-1) == ARB_KIOSK) {
         int score = kiosk_score(end, simulated);
-        if (score == INT_MIN) { fprintf(stderr, "arbitration: less than 3 s heard, answers without a claim\n"); trigger(0, end); return; }
-        claim(kw, score, prio, end);
+        if (score == INT_MIN) { fprintf(stderr, "arbitration: less than 3 s heard, answers without a claim\n"); trigger(0, end, slot); return; }
+        claim(kw, score, prio, end, slot);
         return;
     }
     int own = wake_score(begin, end, simulated);
     /* the front end's score only for a round: arbitration off, or nobody to ask, and the claim is only a log line */
-    if (!arb_rounds() || !afe_start(simulated)) { claim(kw, own, prio, end); return; }
-    pend.end = end; pend.own = own; pend.prio = prio; snprintf(pend.kw, sizeof pend.kw, "%s", kw);
+    if (!arb_rounds() || !afe_start(simulated)) { claim(kw, own, prio, end, slot); return; }
+    pend.end = end; pend.own = own; pend.prio = prio; pend.slot = slot; snprintf(pend.kw, sizeof pend.kw, "%s", kw);
     score_due = mono_ms() + AFE_WAIT_MS;
     duck_round(score_due);                          /* until the claim says how long the round runs */
 }
@@ -2018,7 +2103,7 @@ static void score_wait(void)                        /* capture thread, while sco
     score_due = 0;
     if (afe != INT_MIN) { fprintf(stderr, "wake: score %d from the front end (%d from the mic stream)\n", afe, pend.own); score = afe; }
     else if (busy) { fprintf(stderr, "wake: no score from the front end within %d ms, the mic stream's goes\n", AFE_WAIT_MS); afe_late = 1; }
-    claim(pend.kw, score, pend.prio, pend.end);
+    claim(pend.kw, score, pend.prio, pend.end, pend.slot);
 }
 
 /* The keyword the loaded model answers to (capture thread).  Amazon's en-US sets for "Computer", "Amazon" and "Ziggy"
@@ -2093,8 +2178,8 @@ static void on_wake(int slot, const char *keyword, uint64_t begin, uint64_t end)
     atomic_store(&wake_slot_heard, slot);
     { float db = 10 * log10f((ring_power(begin, end) + 1) / (32768.0f * 32768.0f));     /* the talker's level, for the gain */
       pthread_mutex_lock(&core_lock); keyword_db = db; heard_ms = last_wake_ms; kw_begin = begin; kw_end = end; kw_slot = slot; snprintf(wake_phrase, sizeof wake_phrase, "%s", wake_loaded[slot]); pthread_mutex_unlock(&core_lock); }
-    if (!arb_running()) { trigger(0, end); return; }
-    pthread_mutex_lock(&core_lock); det_begin = begin; det_end = end; pthread_mutex_unlock(&core_lock);
+    if (!arb_running()) { trigger(0, end, slot); return; }
+    pthread_mutex_lock(&core_lock); det_begin = begin; det_end = end; det_slot = slot; pthread_mutex_unlock(&core_lock);
     atomic_store(&det_pending, 1);                  /* the ring is the capture thread's */
 }
 
@@ -2151,7 +2236,13 @@ static void on_pair(void)
 
 /* ---------------------------------------------------------------- playback queue */
 
-struct item { struct item *next; int kind, media; unsigned rate, ch; size_t len; unsigned char data[]; };   /* media: Q_START */
+struct item {
+    struct item *next;
+    int kind, media;
+    unsigned run, rate, ch;    /* run = 0 for ordinary media and Assist */
+    size_t len;
+    unsigned char data[];
+};
 enum { Q_START, Q_DATA, Q_STOP };
 static void tts_kind(int media);
 
@@ -2159,45 +2250,200 @@ static pthread_mutex_t q_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t q_cond = PTHREAD_COND_INITIALIZER;
 static struct item *q_head, *q_tail;
 static size_t q_bytes;
+static unsigned q_cut_run;      /* out-of-band, so a cut also wakes an empty queue */
 
-static void q_push(int kind, int media, unsigned rate, unsigned ch, const void *data, size_t len)
+/* The playback worker is the only caller of play_write and owns this tap. */
+void (*audio_realtime_rendered)(const int16_t *pcm, size_t frames, unsigned queued_frames);
+static unsigned realtime_render_run;
+
+static void playback_reference(const int16_t *pcm, size_t frames, unsigned queued_frames)
+{
+    realtime_echo_render(realtime_render_run, cap_clock(), pcm, frames, queued_frames);
+}
+
+static int q_push_for(unsigned run, int kind, int media, unsigned rate, unsigned ch, const void *data, size_t len)
 {
     struct item *it = malloc(sizeof *it + len);
-    if (!it) return;
-    it->next = NULL; it->kind = kind; it->media = media; it->rate = rate; it->ch = ch; it->len = len;
+    if (!it) return -1;
+    it->next = NULL; it->kind = kind; it->media = media; it->run = run;
+    it->rate = rate; it->ch = ch; it->len = len;
     if (len) memcpy(it->data, data, len);
     pthread_mutex_lock(&q_lock);
     if (q_tail) q_tail->next = it; else q_head = it;
     q_tail = it; q_bytes += len;
     pthread_cond_signal(&q_cond);
     pthread_mutex_unlock(&q_lock);
+    return 0;
+}
+
+static void q_push(int kind, int media, unsigned rate, unsigned ch, const void *data, size_t len)
+{
+    q_push_for(0, kind, media, rate, ch, data, len);
+}
+
+static void realtime_output_cut(unsigned run)
+{
+    pthread_mutex_lock(&q_lock);
+    struct item **link = &q_head;
+    q_tail = NULL;
+    while (*link) {
+        struct item *item = *link;
+        if (item->run == run) {
+            *link = item->next;
+            q_bytes -= item->len;
+            free(item);
+        } else {
+            q_tail = item;
+            link = &item->next;
+        }
+    }
+    q_cut_run = run;
+    pthread_cond_signal(&q_cond);
+    pthread_mutex_unlock(&q_lock);
+}
+
+static void realtime_output_done(unsigned run, int heard_ms, int cut)
+{
+    /* The playback thread finished or flushed this reply. */
+    atomic_store(&tts_on, 0);
+    playback_hint();
+    pthread_mutex_lock(&core_lock);
+    if (run == atomic_load(&realtime_run)) {
+        realtime_heard = heard_ms;
+        if (cut || !realtime_cutting) {
+            realtime_reply = realtime_cutting = 0;
+            core_set_state(LISTENING);
+        }
+    }
+    pthread_mutex_unlock(&core_lock);
+}
+
+static int realtime_drain_allowed(void *arg)
+{
+    unsigned run = *(const unsigned *)arg;
+    pthread_mutex_lock(&q_lock);
+    int allowed = q_cut_run != run && run == atomic_load(&realtime_run);
+    pthread_mutex_unlock(&q_lock);
+    return allowed;
+}
+
+static int realtime_heard_ms(long long total_us, long long until_us)
+{
+    long long pending = until_us - mono_ms() * 1000;
+    if (pending < 0) pending = 0;
+    return pending < total_us ? (int)((total_us - pending) / 1000) : 0;
+}
+
+static int prepare_voip(unsigned run)
+{
+    pthread_mutex_lock(&core_lock);
+    int available = run == atomic_load(&realtime_run) && dropin_was == DROPIN_IDLE;
+    if (available) listening(0);     /* let the DSP adapt while the far end speaks */
+    pthread_mutex_unlock(&core_lock);
+    if (!available) return 0;
+
+    if (!realtime_voip_open()) return 1;
+    pthread_mutex_lock(&core_lock);
+    if (run == atomic_load(&realtime_run)) listening(1);
+    pthread_mutex_unlock(&core_lock);
+    fprintf(stderr, "realtime: Voip playback unavailable run=%u, using TTS\n", run);
+    return 0;
+}
+
+static void discard_reply(unsigned run, unsigned *voip_run)
+{
+    if (run && run == *voip_run) {
+        if (run != atomic_load(&realtime_run) || realtime_voip_flush()) {
+            realtime_voip_close();
+            realtime_reply_playback(run, 0);
+            *voip_run = 0;
+        }
+    } else play_close(0);
+    if (run) realtime_echo_render_end(run, cap_clock(), 1);
 }
 
 static void *playback_thread(void *arg)
 {
-    int open = 0, play_media = 0, play_ch = 1; unsigned play_rate = 0;
+    int open = 0, play_media = 0, play_ch = 1; unsigned play_rate = 0, play_run = 0;
+    unsigned voip_run = 0, voip_failed_run = 0;   /* the mixer handle can outlive one reply */
+    long long rt_total_us = 0, rt_until_us = 0;
     long long play_t0 = 0, play_frames = 0;     /* the TTS stream's queue as the mixer's music queue is modelled
                                                  * (audio_mixer.c s_queued_us): written minus what real time played */
     (void)arg;
     for (;;) {
         pthread_mutex_lock(&q_lock);
-        while (!q_head) pthread_cond_wait(&q_cond, &q_lock);
+        while (!q_head && !q_cut_run && (!voip_run || voip_run == atomic_load(&realtime_run)))
+            pthread_cond_wait(&q_cond, &q_lock);
+        if (voip_run && voip_run != atomic_load(&realtime_run)) {
+            pthread_mutex_unlock(&q_lock);
+            unsigned ended = voip_run;
+            if (play_run == ended) {
+                discard_reply(play_run, &voip_run);
+                play_run = 0;
+                open = 0;
+                realtime_output_done(ended, 0, 1);
+            } else {
+                realtime_voip_close();
+                voip_run = 0;
+            }
+            continue;
+        }
+        if (q_cut_run) {
+            unsigned cut = q_cut_run;
+            q_cut_run = 0;
+            pthread_mutex_unlock(&q_lock);
+            int heard_ms = 0;
+            if (play_run == cut) {
+                heard_ms = realtime_heard_ms(rt_total_us, rt_until_us);
+                if (open) discard_reply(play_run, &voip_run);
+                open = 0;
+                play_run = 0;
+                realtime_output_done(cut, heard_ms, 1);
+            } else {
+                pthread_mutex_lock(&core_lock);
+                if (cut == atomic_load(&realtime_run)) {
+                    realtime_reply = realtime_cutting = 0;
+                    core_set_state(LISTENING);
+                }
+                pthread_mutex_unlock(&core_lock);
+            }
+            continue;
+        }
         struct item *it = q_head;
         q_head = it->next; if (!q_head) q_tail = NULL;
         q_bytes -= it->len;
         pthread_mutex_unlock(&q_lock);
 
-        if (atomic_load(&flush_playback) && it->kind != Q_STOP) {
-            if (open) { play_close(0); open = 0; }
+        if ((it->run && it->run != atomic_load(&realtime_run)) ||
+            (it->kind == Q_DATA && it->run != play_run)) {
+            free(it);
+            continue;
+        }
+        if (!it->run && atomic_load(&flush_playback) && it->kind != Q_STOP) {
+            if (open) {
+                discard_reply(play_run, &voip_run);
+                open = 0;
+            }
             free(it);
             continue;
         }
         switch (it->kind) {
         case Q_START:
-            if (open) play_close(1);        /* e.g. announcement chime followed by the message */
+            if (open) {                         /* e.g. announcement chime followed by the message */
+                if (play_run) discard_reply(play_run, &voip_run);
+                else play_close(1);
+            }
+            play_run = it->run;
+            rt_total_us = rt_until_us = 0;
             tts_kind(it->media);            /* the TTS stream's volume for what comes now */
             play_media = it->media; play_rate = it->rate; play_ch = it->ch; play_t0 = 0; play_frames = 0;
-            open = play_open(it->rate, it->ch) == 0;
+            if (play_run && play_run != voip_run && play_run != voip_failed_run &&
+                realtime_wants_voip(play_run)) {
+                if (prepare_voip(play_run)) voip_run = play_run;
+                else voip_failed_run = play_run;
+            }
+            open = play_run && play_run == voip_run ? 1 : play_open(it->rate, it->ch) == 0;
+            if (open && play_run) realtime_reply_playback(play_run, play_run == voip_run);
             if (open) { atomic_store(&tts_on, 1); playback_hint(); }
             if (!open) fprintf(stderr, "play: open %u Hz x%u failed\n", it->rate, it->ch);
             break;
@@ -2218,16 +2464,63 @@ static void *playback_thread(void *arg)
                 musiclight_feed((const int16_t *)it->data, frames, play_ch, play_rate, q * 1000);
                 play_frames += (long long)frames;
             }
-            if (open && play_write(it->data, it->len) < 0) { play_close(0); open = 0; }
+            if (open) {
+                long long start_us = play_run ? mono_ms() * 1000 : 0;
+                realtime_render_run = play_run;
+                audio_realtime_rendered = play_run ? playback_reference : NULL;
+                int use_voip = play_run && play_run == voip_run;
+                int written = use_voip ? realtime_voip_write(it->data, it->len) : play_write(it->data, it->len);
+                audio_realtime_rendered = NULL;
+                if (written < 0) {
+                    fprintf(stderr, "play: write failed\n");
+                    if (use_voip) {
+                        realtime_voip_close();
+                        realtime_reply_playback(play_run, 0);
+                        voip_failed_run = play_run;
+                        voip_run = 0;
+                    } else play_close(0);
+                    if (play_run) realtime_echo_render_end(play_run, cap_clock(), 1);
+                    open = 0;
+                }
+                else if (play_run) {
+                    /* Mixer has no playhead. Estimate from submitted frames and elapsed time, accounting for underruns. */
+                    long long duration_us = (long long)(it->len / 2) * 1000000 / REALTIME_RATE;
+                    rt_total_us += duration_us;
+                    if (rt_until_us < start_us) rt_until_us = start_us;
+                    rt_until_us += duration_us;
+                }
+            }
             break;
         case Q_STOP:
+            if (it->run) {
+                if (play_run == it->run) {
+                    int use_voip = play_run == voip_run;
+                    int drained = !open || (use_voip ? realtime_voip_drain(realtime_drain_allowed, &it->run)
+                                                    : play_close_realtime(realtime_drain_allowed, &it->run));
+                    if (open) {
+                        if (use_voip && !drained) discard_reply(play_run, &voip_run);
+                        else realtime_echo_render_end(play_run, cap_clock(), !drained);
+                    }
+                    int heard_ms = drained ? (int)(rt_total_us / 1000) : realtime_heard_ms(rt_total_us, rt_until_us);
+                    open = 0;
+                    play_run = 0;
+                    realtime_output_done(it->run, heard_ms, 0);
+                }
+                break;
+            }
+            if (play_run) {
+                pthread_mutex_lock(&core_lock);
+                if (proto->played) proto->played();
+                pthread_mutex_unlock(&core_lock);
+                break;
+            }
             if (open) { play_close(1); open = 0; }
             atomic_store(&tts_on, 0); playback_hint();
             pthread_mutex_lock(&core_lock);
             atomic_store(&flush_playback, 0);       /* under the lock: a wake word between would cut the next reply */
             if (proto->played) proto->played();      /* also without a client: modules reset their state here */
             if (wake_cut) wake_cut = 0;              /* cut for Home Assistant's wake word: its run is the request (core_remote_wake) */
-            else core_pipeline_finish();
+            else if (!core_realtime_active()) core_pipeline_finish();
             pthread_mutex_unlock(&core_lock);
             break;
         }
@@ -2236,8 +2529,86 @@ static void *playback_thread(void *arg)
     return NULL;
 }
 
+int core_realtime_audio(unsigned run, const void *pcm, size_t bytes)
+{
+    int rc = -1;
+    pthread_mutex_lock(&core_lock);
+    if (run && run == atomic_load(&realtime_run) && !core_muted() &&
+        core_tts_queued() + bytes <= (size_t)REALTIME_RATE * 2 * 45) {
+        rc = 0;
+        if (!realtime_reply) {
+            rc = q_push_for(run, Q_START, 0, REALTIME_RATE, 1, NULL, 0);
+            if (!rc) {
+                realtime_reply = 1;
+                realtime_heard = 0;
+                speak_media = 0;
+                core_set_state(SPEAKING);
+            }
+        }
+        /* Keep a blocked mixer write short enough to honour the next flush. */
+        const unsigned char *p = pcm;
+        for (size_t offset = 0; !rc && offset < bytes; ) {
+            size_t chunk = bytes - offset, limit = REALTIME_RATE / 50 * 2;
+            if (chunk > limit) chunk = limit;
+            rc = q_push_for(run, Q_DATA, 0, 0, 0, p + offset, chunk);
+            offset += chunk;
+        }
+    }
+    pthread_mutex_unlock(&core_lock);
+    return rc;
+}
+
+void core_realtime_drain(unsigned run)
+{
+    pthread_mutex_lock(&core_lock);
+    if (run == atomic_load(&realtime_run) && realtime_reply && !realtime_cutting &&
+        q_push_for(run, Q_STOP, 0, 0, 0, NULL, 0)) {
+        realtime_cutting = 1;
+        realtime_output_cut(run);
+    }
+    pthread_mutex_unlock(&core_lock);
+}
+
+void core_realtime_cut(unsigned run)
+{
+    pthread_mutex_lock(&core_lock);
+    if (run == atomic_load(&realtime_run) && realtime_reply && !realtime_cutting) {
+        realtime_cutting = 1;
+        realtime_output_cut(run);
+    }
+    pthread_mutex_unlock(&core_lock);
+}
+
+int core_realtime_played(unsigned run, int *heard_ms)
+{
+    pthread_mutex_lock(&core_lock);
+    int done = run == atomic_load(&realtime_run) && !realtime_reply;
+    if (done) *heard_ms = realtime_heard;
+    pthread_mutex_unlock(&core_lock);
+    return done;
+}
+
+void core_realtime_turn(unsigned run, int hearing)
+{
+    pthread_mutex_lock(&core_lock);
+    if (run == atomic_load(&realtime_run) && !realtime_reply)
+        core_set_state(hearing ? LISTENING : THINKING);
+    pthread_mutex_unlock(&core_lock);
+}
+
+void core_realtime_finish(unsigned run, int failed)
+{
+    pthread_mutex_lock(&core_lock);
+    if (run == atomic_load(&realtime_run)) {
+        if (failed && !core_muted()) led("-s", "anim_start_error_short");
+        core_pipeline_finish();
+    }
+    pthread_mutex_unlock(&core_lock);
+}
+
 void core_tts_begin(unsigned rate, unsigned channels, int media)
 {
+    if (core_realtime_active()) core_pipeline_finish();
     /* wake_wait: a chime and then the message.  -D: the stream stays open, and with it the front end's listening flag
      * (listening(1) of pipeline_start): its cancellers do not adapt during the reply.  As measured on radar (PLAN.md);
      * listening(0) for the reply, as -w remote has it, not tried */
@@ -3518,13 +3889,13 @@ static void *capture_thread(void *arg)
           uint64_t lag = CAP_RATE * 128 / 1000;                       /* ended 128 ms ago, as late as Pryon accepts one */
           if (t == 1) { pthread_mutex_lock(&core_lock); wake_phrase[0] = 0; heard_ms = mono_ms(); wake_told("detected"); pthread_mutex_unlock(&core_lock); }   /* the first one's */
           if (t == 3) wake_tell("near_miss");                         /* SIGTTOU: Pryon's near miss */
-          if (t == 2) trigger(1, 0);
+          if (t == 2) trigger(1, 0, 0);
           else if (t == 1) {
               uint64_t b = ring_n > CAP_RATE ? ring_n - CAP_RATE * 6 / 10 : 0, e = ring_n > CAP_RATE ? ring_n - lag : ring_n;
               pthread_mutex_lock(&core_lock); kw_begin = b; kw_end = e; kw_slot = 0;
               if (getenv("HASSMIC_FAKE_KEYWORD")) keyword_db = 10 * log10f((ring_power(b, e) + 1) / (32768.0f * 32768.0f));   /* as on_wake: the tail is looked for */
               pthread_mutex_unlock(&core_lock);
-              wake_heard(b, e, 1);
+              wake_heard(b, e, 1, 0);
           } }
         if (atomic_exchange(&stop_pending, 0)) stop_word();        /* SIGHUP: the "stop" keyword, for tests on the PC */
         if (n == 0) continue;
@@ -3573,7 +3944,7 @@ static void *capture_thread(void *arg)
             align_ahead();                              /* outside the lock: it takes up to ~0.1 s on an Echo */
             pthread_mutex_lock(&core_lock);
             uint64_t at = cap_clock() - n / 2;
-            if (atomic_load(&streaming) && connected) {
+            if (atomic_load(&streaming) && (connected || core_realtime_active())) {
                 if (!replay_from) send_mic(pcm, n / 2, at);
                 else {                                      /* after the wake word: from its tail's end, this block included */
                     int64_t from = word_tail_end(replay_from, at + n / 2);
@@ -3591,14 +3962,16 @@ static void *capture_thread(void *arg)
                         stream_ring((uint64_t)from, at + n / 2); replay_from = 0;
                     }
                 }
-                if (!replay_from && !whisper_from) whisper_from = talker_from ? talker_from : at;   /* the word's end, or the first block */
-                whisper_at = whisper_from; whisper_kw = run_wake ? kw_end : 0; whisper_at_gen = atomic_load(&whisper_gen);
+                if (!core_realtime_active()) {
+                    if (!replay_from && !whisper_from) whisper_from = talker_from ? talker_from : at;
+                    whisper_at = whisper_from; whisper_kw = run_wake ? kw_end : 0; whisper_at_gen = atomic_load(&whisper_gen);
+                }
                 if (mic_end.ended && atomic_load(&streaming)) heard_end();
             } else replay_from = 0;
             pthread_mutex_unlock(&core_lock);
         }
         if (atomic_load(&whisper_last) != -2) {     /* a model: what streams to the pipeline is one request */
-            int s = atomic_load(&streaming);
+            int s = atomic_load(&streaming) && !core_realtime_active();
             /* a run over: its detector ends.  Also when the next run already started: core_pipeline_finish restarts one
              * (-w remote, a barge-in) in the same lock hold that ends it, so streaming is never 0 here between them */
             if (whisper_on && (!s || atomic_load(&whisper_gen) != atomic_load(&whisper_req))) {
@@ -3629,15 +4002,18 @@ static void *capture_thread(void *arg)
             }
         }
         if (atomic_exchange(&det_pending, 0)) {
-            pthread_mutex_lock(&core_lock); uint64_t b = det_begin, e = det_end; pthread_mutex_unlock(&core_lock);
-            wake_heard(b, e, 0);
+            pthread_mutex_lock(&core_lock);
+            uint64_t b = det_begin, e = det_end;
+            int slot = det_slot;
+            pthread_mutex_unlock(&core_lock);
+            wake_heard(b, e, 0, slot);
         }
         if (score_due) score_wait();
         afe_late_check();
-        if (arb_due && (mono_ms() >= arb_due || arb_settled())) { arb_due = 0; if (arb_decide()) answer(arb_from, 1); else { afe_done(); wake_tell("answered_elsewhere"); } }    /* after this block went out live */
+        if (arb_due && (mono_ms() >= arb_due || arb_settled())) { arb_due = 0; if (arb_decide()) answer(arb_from, 1, arb_slot); else { afe_done(); wake_tell("answered_elsewhere"); } }    /* after this block went out live */
 
         pthread_mutex_lock(&core_lock);
-        if ((state == LISTENING || state == THINKING) && time(NULL) - state_since > PIPELINE_TIMEOUT) {
+        if (!core_realtime_active() && (state == LISTENING || state == THINKING) && time(NULL) - state_since > PIPELINE_TIMEOUT) {
             fprintf(stderr, "pipeline timeout\n");
             core_pipeline_finish();
         }
@@ -3761,6 +4137,7 @@ int main(int argc, char **argv)
     if (arb_running() && ringstop_start()) fprintf(stderr, "ringstop: no thread, a stop here ends no ring elsewhere\n");
     if (dropin_port && arb_running() && dropin_start(dropin_port)) fprintf(stderr, "drop in: not available\n");
 
+    realtime_config_init();
     pthread_t cap_t, play_t, ear_t;
     pthread_create(&cap_t, NULL, capture_thread, NULL);
     pthread_create(&play_t, NULL, playback_thread, NULL);

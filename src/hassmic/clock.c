@@ -75,6 +75,16 @@ int clock_synced(void)
 #endif
 }
 
+int clock_local(struct tm *out)
+{
+#ifdef __ANDROID__
+    char zone[PROP_VALUE_MAX];
+    if (!__system_property_get("persist.sys.timezone", zone)) return 0;
+#endif
+    time_t now = time(NULL);
+    return now != (time_t)-1 && clock_synced() && localtime_r(&now, out);
+}
+
 void clock_from_ha(uint32_t epoch)
 {
     char p[300], t[64]; struct timespec bt;

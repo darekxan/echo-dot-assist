@@ -558,6 +558,12 @@ static void s_close(struct pstream *s, int drain)
 int  play_open(unsigned rate, unsigned channels) { return s_open(&voice, rate, channels, SL_ANDROID_STREAM_MEDIA); }
 int  play_write(const void *data, size_t len) { return s_write(&voice, data, len); }
 void play_close(int drain) { s_close(&voice, drain); }
+int play_close_realtime(int (*keep_draining)(void *), void *arg)
+{
+    int drain = keep_draining(arg);
+    play_close(drain);
+    return drain;
+}
 
 int       music_open(unsigned rate, unsigned channels) { return s_open(&music, rate, channels, SL_ANDROID_STREAM_MEDIA); }
 int       music_write(const void *data, size_t len) { return s_write(&music, data, len); }
@@ -588,6 +594,17 @@ int  callmic_present(void) { return 0; }
 int  callmic_open(void) { return -1; }
 int  callmic_read(const void **data) { (void)data; return -1; }
 void callmic_close(void) {}
+
+/* Android's generic media path has no Cannoli DSP call route. */
+int  realtime_voip_supported(void) { return 0; }
+int  realtime_voip_open(void) { return -1; }
+int  realtime_voip_write(const void *data, size_t len) { (void)data; (void)len; return -1; }
+int  realtime_voip_drain(int (*keep_draining)(void *), void *arg) { (void)keep_draining; (void)arg; return 0; }
+int  realtime_voip_flush(void) { return -1; }
+void realtime_voip_close(void) {}
+int  realtime_hfp_open(void) { return -1; }
+int  realtime_hfp_read(const void **data) { (void)data; return -1; }
+void realtime_hfp_close(void) {}
 
 /* On the music stream with everything else of ours (the volume above).  go() says how long the sound is wanted: a
  * ringing timer ends when someone stops it, so what is left of the queue is dropped then, not drained.  Written a

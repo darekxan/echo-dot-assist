@@ -25,4 +25,6 @@ int  clock_zone_info(char *zone, size_t cap, const char **how, char cc[3][3]);  
 void clock_home(double lat, double lon);
 void clock_home_expect(void);                   /* zone.home asked for: the zone waits up to 2 s for it (once a run) */
 int  clock_synced(void);                        /* root set the clock from Home Assistant since boot */
+struct tm;
+int  clock_local(struct tm *out);                /* current local time when the clock and local zone are known */
 #endif

@@ -678,6 +678,23 @@ dialog.modal::backdrop { background: rgba(8, 12, 16, .55); backdrop-filter: blur
               background: var(--surface-2); border-radius: 0 0 20px 20px; }
 .modal-foot .help { margin: 0; flex: 1; }
 dialog.ask { width: min(480px, calc(100% - 32px)); }
+dialog.realtime { width: min(620px, calc(100% - 32px)); }
+#realtime-form, .realtime-fields { display: grid; gap: 12px; }
+#realtime-form .realtime-slots { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 12px; }
+#realtime-form .field :is(select, textarea, input[type=text], input[type=password]) { width: 100%; min-width: 0; }
+#realtime-form textarea, #realtime-form input[type=number] {
+  font: inherit; font-size: 14px; color: var(--fg); background: var(--surface);
+  border: 1px solid var(--line-2); border-radius: 9px; padding: 7px 10px;
+}
+#realtime-form textarea { resize: vertical; }
+#realtime-form input[type=number] { width: 110px; }
+#realtime-form .realtime-check { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 13px; }
+#realtime-form > :is(h3, p), .realtime-fields p { margin: 0; }
+#realtime-form p:empty { display: none; }
+#realtime-form details { border-top: 1px solid var(--line); padding-top: 10px; }
+#realtime-form summary { cursor: pointer; font-size: 14px; }
+.realtime-fields { margin-top: 10px; }
+#realtime-form fieldset.realtime-fields { min-width: 0; padding: 0; border: 0; margin: 0; }
 /* the log: as big as the window allows, the lines scroll, tools and foot stay */
 dialog.logs { width: min(1100px, calc(100% - 32px)); height: min(880px, calc(100% - 32px)); }
 .logs .modal-head .icon-btn:first-of-type { margin-right: -6px; }

@@ -54,6 +54,9 @@
 #include "diag.h"
 #include "sound.h"
 #include "hash.h"
+#include "json.h"
+#include "realtime.h"
+#include "realtime_config.h"
 #include "mww.h"
 #include "ringdesign.h"
 #include "ringlive.h"
@@ -1006,10 +1009,12 @@ static void vouch_api(int fd, struct req *r)
  * (64 bytes) = BLAKE2b-512 keyed with EK over the request's counter, "\n" and the byte i, EK = BLAKE2b-256 keyed with K
  * over "hassmic seal 1".  The counter is new with every request of a browser (signed_ok takes each once), so no
  * stream serves twice; the request's MAC covers the sealed bytes.  web/crypto.js seal does the other half. */
+#define REALTIME_SEALED_BYTES (64 * 48)
+
 static int unseal(const struct req *r, const uint8_t *in, size_t n, uint8_t *out)
 {
     uint8_t pub[32], k[32], ek[32], ks[64]; crypto_blake2b_ctx ctx; int bad;
-    if (n > 64 * 40 || unhex(pub, r->pub, 32)) return -1;   /* callers bound n by their buffers: a Wi-Fi password, a token */
+    if (n > REALTIME_SEALED_BYTES || unhex(pub, r->pub, 32)) return -1;   /* callers also bound n by their buffers */
     pthread_mutex_lock(&lk); bad = session_key(k, pub); pthread_mutex_unlock(&lk);
     if (bad) return -1;
     crypto_blake2b_keyed(ek, 32, k, 32, (const uint8_t *)"hassmic seal 1", 14);
@@ -1066,6 +1071,102 @@ static void mass_api(int fd, struct req *r)
     if (rc == -3) { respond_sjson(fd, r, 409, "{\"error\":\"A new address takes the token again: it only ever goes where it was given\"}"); return; }
     char o[4096]; size_t n = mass_status_json(o, sizeof o);
     respond_s(fd, r, rc ? 500 : 200, "application/json", NULL, o, n);
+}
+
+static void realtime_status(int fd, struct req *r)
+{
+    char out[16384], names[2][64] = {{0}};
+    const char *wake[] = { names[0], names[1] };
+    const struct core_wake_word *words;
+    int active[CORE_WAKE_ACTIVE_MAX], available, voip_supported;
+
+    pthread_mutex_lock(&core_lock);
+    available = core_realtime_supported();
+    voip_supported = core_realtime_voip_supported();
+    int count = core_wake_words(&words);
+    int n = core_local_wake && count ? core_wake_active(active) : 0;
+    for (int i = 0; i < n && i < 2; i++)
+        if (active[i] >= 0 && active[i] < count)
+            snprintf(names[i], sizeof names[i], "%s", words[active[i]].name);
+    pthread_mutex_unlock(&core_lock);
+
+    size_t len = realtime_config_status(out, sizeof out, wake, available, voip_supported);
+    if (len) respond_s(fd, r, 200, "application/json", NULL, out, len);
+    else respond_sjson(fd, r, 500, "{\"error\":\"Unable to read Realtime settings\"}");
+}
+
+/* Both values share a sealed envelope. Each request counter may be used to seal only one byte stream. */
+static int realtime_unseal(const struct req *r, const struct json *j, char *plain, const char **token)
+{
+    int field = json_get(j, 0, "secret_box");
+    *token = plain;
+    if (field < 0) return 0;
+    if (json_type(j, field) != J_STR) return -1;
+    size_t len = (size_t)(j->t[field].end - j->t[field].start);
+    if (!len || len > 2 * REALTIME_SEALED_BYTES || len % 128) return -1;
+
+    char hex[2 * REALTIME_SEALED_BYTES + 1];
+    uint8_t sealed[REALTIME_SEALED_BYTES];
+    memcpy(hex, j->s + j->t[field].start, len);
+    hex[len] = 0;
+    int n = unhex_any(sealed, sizeof sealed, hex);
+    if (n != (int)(len / 2) || unseal(r, sealed, (size_t)n, (uint8_t *)plain)) return -1;
+    size_t key_length = strnlen(plain, (size_t)n);
+    if (key_length >= (size_t)n || key_length >= sizeof ((struct realtime_config *)0)->api_key) return -1;
+    const char *second = plain + key_length + 1;
+    size_t remaining = (size_t)n - key_length - 1;
+    size_t token_length = strnlen(second, remaining);
+    if (token_length >= remaining || token_length >= sizeof ((struct realtime_config *)0)->ha_token) return -1;
+    for (size_t i = token_length + 1; i < remaining; i++) if (second[i]) return -1;
+    *token = second;
+    return 0;
+}
+
+static void realtime_save(int fd, struct req *r)
+{
+    struct json j = {0};
+    char plain[REALTIME_SEALED_BYTES] = {0};
+    const char *token;
+    const char *error = "Invalid Realtime settings";
+    enum realtime_config_result rc = REALTIME_CONFIG_INVALID;
+    if (r->blen && !memchr(r->body, 0, r->blen) && !json_parse(&j, r->body, r->blen) &&
+        json_type(&j, 0) == J_OBJ && !realtime_unseal(r, &j, plain, &token))
+        rc = realtime_config_save(&j, plain, token, &error);
+    crypto_wipe(plain, sizeof plain);
+    json_free(&j);
+    if (rc == REALTIME_CONFIG_OK) realtime_status(fd, r);
+    else {
+        char msg[256], out[280];
+        json_esc(msg, sizeof msg, error);
+        snprintf(out, sizeof out, "{\"error\":%s}", msg);
+        int status = rc == REALTIME_CONFIG_CONFLICT ? 409 : rc == REALTIME_CONFIG_IO ? 500 : 400;
+        respond_sjson(fd, r, status, out);
+    }
+}
+
+static void realtime_api(int fd, struct req *r)
+{
+    int get = !strcmp(r->method, "GET");
+    if (!signed_ok(r, !get)) { respond_json(fd, 401, "{\"error\":\"not logged in\"}"); return; }
+    if (!strcmp(r->path, "/api/realtime")) {
+        if (get) realtime_status(fd, r);
+        else if (!strcmp(r->method, "POST")) realtime_save(fd, r);
+        else respond_sjson(fd, r, 405, "{\"error\":\"method not allowed\"}");
+        return;
+    }
+    int openai = !strcmp(r->path, "/api/realtime/test/openai");
+    if (strcmp(r->method, "POST") || (!openai && strcmp(r->path, "/api/realtime/test/home-assistant"))) {
+        respond_sjson(fd, r, 404, "{\"error\":\"not found\"}");
+        return;
+    }
+
+    struct realtime_config cfg;
+    realtime_config_get(&cfg);
+    int ready = openai ? !!cfg.api_key[0] : cfg.ha_endpoint[0] && cfg.ha_token[0];
+    int ok = ready && !(openai ? realtime_test_openai(&cfg) : realtime_test_home_assistant(&cfg));
+    realtime_config_clear(&cfg);
+    respond_sjson(fd, r, 200, ok ? "{\"status\":\"ok\"}" :
+                  ready ? "{\"status\":\"failed\"}" : "{\"status\":\"not_configured\"}");
 }
 
 /* /api/wifi        GET   the network now, the last scan, the last switch (wifi.c)
@@ -1274,6 +1375,7 @@ static void handle(int fd)
     else if (!strncmp(r.path, "/api/mww", 8)) mww_api(fd, &r);
     else if (!strncmp(r.path, "/api/ring", 9)) ring_api(fd, &r);
     else if (!strncmp(r.path, "/api/wifi", 9)) wifi_api(fd, &r);
+    else if (!strcmp(r.path, "/api/realtime") || !strncmp(r.path, "/api/realtime/test/", 19)) realtime_api(fd, &r);
     else if (!strcmp(r.path, "/api/mass")) mass_api(fd, &r);
     else if (!strcmp(r.path, "/api/screen")) screen_api(fd, &r);
     else if (!strncmp(r.path, "/api/timer-sound", 16)) timer_sound_api(fd, &r);

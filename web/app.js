@@ -1219,7 +1219,10 @@ function settingCards(list, id) {
 // What only some pages have, beside their settings cards
 const PAGE_BUILD = {
   overview: (el) => buildOverview(el),
-  voice: (el, list) => { el.append(flow(settingCards(list.filter((s) => !soundSwitch(s.name)), 'voice'))); el.append(h('div', { class: 'ringd' }, soundsCard(), packsCard())); },   // laid out as lights' ring designs
+  voice: (el, list) => {
+    el.append(flow([...settingCards(list.filter((s) => !soundSwitch(s.name)), 'voice'), realtimeCard()]));
+    el.append(h('div', { class: 'ringd' }, soundsCard(), packsCard()));
+  },
   wake: (el, list) => { el.append(flow(settingCards(list, 'wake'))); buildWake(el); },
   sound: (el, list) => {
     const vol = h('div', {}), cards = [];
@@ -3094,6 +3097,285 @@ function massDialog() {
       h('p', { class: 'help' }, 'The token goes only there. An IP address is surer than a name: a name (a .local one above all) goes to whoever answers to it on the network.')));
   m.foot.append(h('button', { onclick: () => m.dlg.close() }, 'Cancel'), go);
   m.show(); tok.focus();
+}
+
+// ---------------------------------------------------------------- OpenAI Realtime (on this Echo)
+
+function realtimeCard() {
+  const configure = h('button', { type: 'button', onclick: async () => {
+    configure.disabled = true;
+    try { realtimeDialog((await echo.call('GET', '/api/realtime')).json()); }
+    catch (e) { toast(errText(e)); }
+    finally { configure.disabled = false; }
+  } }, 'Configure…');
+  return h('div', { class: 'card', id: 'realtime' },
+    cardHead('Voice assistants', 'Choose Home Assistant Assist or OpenAI Realtime for each wake-word slot.', 'talk'),
+    h('div', { class: 'card-foot btns' }, configure));
+}
+
+function realtimeDialog(saved) {
+  const m = modal('Voice assistants', 'realtime');
+  let form, status, openaiStatus, haStatus, save, saveTest, inputs, busy = false;
+
+  const label = (name, title, input, hint) => h('div', { class: 'field' },
+    h('label', { for: 'realtime-' + name }, title), input, hint ? h('p', { class: 'help' }, hint) : null);
+  const make = (name, props) => h('input', { id: 'realtime-' + name, ...props });
+  const text = (name, value, maxlength, placeholder) =>
+    make(name, { type: 'text', value, maxlength, placeholder, autocomplete: 'off', spellcheck: 'false' });
+  const number = (name, value, min, max) => make(name, { type: 'number', value, min, max, step: 1, required: true });
+  const checkbox = (name, caption, checked) =>
+    h('label', { class: 'realtime-check', for: 'realtime-' + name }, make(name, { type: 'checkbox', checked }), caption);
+  function choice(name, value, options) {
+    const input = h('select', { id: 'realtime-' + name }, options.map(([value, title]) => h('option', { value }, title)));
+    input.value = value;
+    return input;
+  }
+
+  function suggestions(name, title, value, maxlength, options, placeholder) {
+    const input = text(name, value, maxlength, placeholder);
+    const list = 'realtime-' + name + '-choices';
+    input.setAttribute('list', list);
+    const choices = h('datalist', { id: list }, options.map((value) => h('option', { value })));
+    return { input, el: label(name, title, [input, choices]) };
+  }
+
+  function openaiOptions(...audioRouting) {
+    const model = suggestions('model', 'Model', saved.model, 95,
+      ['gpt-realtime-2.1-mini', 'gpt-realtime-2.1', 'gpt-realtime-2', 'gpt-realtime', 'gpt-realtime-mini']);
+    const tokenMode = choice('token-limit', saved.max_output_tokens ? 'custom' : 'unlimited',
+      [['unlimited', 'Unlimited'], ['custom', 'Custom']]);
+    const tokenLimit = number('output-tokens', saved.max_output_tokens || 1024, 1, 4096);
+    const tokenRow = label('output-tokens', 'Output token limit', tokenLimit);
+    const updateTokenLimit = () => {
+      tokenLimit.disabled = tokenMode.value !== 'custom';
+      tokenRow.classList.toggle('hidden', tokenLimit.disabled);
+    };
+    tokenMode.onchange = updateTokenLimit;
+    updateTokenLimit();
+    const effort = choice('reasoning-effort', saved.reasoning_effort || '',
+      [['', 'Model default'], ['minimal', 'Minimal'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra high']]);
+    const legacyModels = ['gpt-realtime', 'gpt-realtime-mini', 'gpt-realtime-1.5',
+      'gpt-realtime-2025-08-28', 'gpt-realtime-mini-2025-10-06', 'gpt-realtime-mini-2025-12-15'];
+    const effortHint = h('p', { class: 'help' });
+    const effortRow = label('reasoning-effort', 'Reasoning effort', [effort, effortHint]);
+    const updateEffort = () => {
+      effort.disabled = legacyModels.includes(model.input.value.trim());
+      effortHint.textContent = effort.disabled ? 'This model has no configurable reasoning effort.' :
+        'Explicit settings require a model that supports reasoning.';
+    };
+    model.input.addEventListener('input', updateEffort);
+    updateEffort();
+    const voice = suggestions('voice', 'Voice', saved.voice, 63,
+      ['alloy', 'ash', 'ballad', 'cedar', 'coral', 'echo', 'marin', 'sage', 'shimmer', 'verse']);
+    const noise = choice('noise-reduction', saved.noise_reduction || '',
+      [['', 'Provider default'], ['off', 'Off'], ['near_field', 'Near field'], ['far_field', 'Far field']]);
+    const turn = choice('turn-detection', saved.turn_detection || 'server_vad',
+      [['server_vad', 'Normal'], ['semantic_vad', 'Semantic']]);
+    const eagerness = choice('semantic-eagerness', saved.semantic_eagerness || 'auto',
+      [['auto', 'Automatic'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High']]);
+    const threshold = make('vad-threshold', { type: 'number', min: 0, max: 1, step: '0.01', required: true,
+      value: ((saved.vad_threshold ?? 50) / 100).toFixed(2) });
+    const prefix = number('vad-prefix', saved.vad_prefix_padding_ms ?? 300, 0, 2000);
+    const silence = number('vad-silence', saved.vad_silence_duration_ms ?? 500, 100, 10000);
+    const numeric = (input, fallback, fractional = false) => {
+      const value = input.valueAsNumber;
+      return (fractional || Number.isInteger(value)) && value >= +input.min && value <= +input.max ? value : fallback;
+    };
+
+    const normal = h('fieldset', { class: 'realtime-fields' },
+      label('vad-threshold', 'Threshold', threshold),
+      label('vad-prefix', 'Prefix padding (ms)', prefix),
+      label('vad-silence', 'Silence duration (ms)', silence));
+    const semantic = label('semantic-eagerness', 'Semantic eagerness', eagerness);
+    const updateTurn = () => {
+      const isNormal = turn.value === 'server_vad';
+      normal.disabled = !isNormal;
+      normal.classList.toggle('hidden', !isNormal);
+      eagerness.disabled = isNormal;
+      semantic.classList.toggle('hidden', isNormal);
+    };
+    turn.onchange = updateTurn;
+    updateTurn();
+    const section = (name, caption, open, ...fields) =>
+      h('details', { 'data-realtime-section': name, open }, h('summary', {}, caption), h('div', { class: 'realtime-fields' }, fields));
+    const isOpen = (name, fallback) => form?.querySelector('[data-realtime-section="' + name + '"]')?.open ?? fallback;
+
+    return {
+      sections: [
+        section('model', 'Model', isOpen('model', true), model.el,
+          label('token-limit', 'Max tokens', tokenMode, 'Unlimited uses the model’s maximum.'), tokenRow,
+          effortRow),
+        section('audio', 'Audio', isOpen('audio', true), ...audioRouting, voice.el,
+          label('noise-reduction', 'Noise reduction', noise)),
+        section('conversation', 'Conversation behavior', isOpen('conversation', false),
+          label('turn-detection', 'Automatic turn detection', turn), normal, semantic),
+      ],
+      profile: () => ({
+        model: model.input.value.trim(), voice: voice.input.value.trim(),
+        max_output_tokens: tokenLimit.disabled ? 0 : tokenLimit.valueAsNumber, reasoning_effort: effort.value, noise_reduction: noise.value,
+        turn_detection: turn.value, semantic_eagerness: eagerness.value,
+        vad_threshold: Math.round(100 * numeric(threshold, (saved.vad_threshold ?? 50) / 100, true)),
+        vad_prefix_padding_ms: numeric(prefix, saved.vad_prefix_padding_ms ?? 300),
+        vad_silence_duration_ms: numeric(silence, saved.vad_silence_duration_ms ?? 500),
+      }),
+    };
+  }
+
+  function secret(name, title, exists, max) {
+    const field = make(name, { type: 'password', maxlength: max, autocomplete: 'new-password',
+      placeholder: exists ? 'Leave blank to keep the saved value' : undefined });
+    const clear = checkbox(name + '-clear', 'Clear saved ' + title.toLowerCase(), false);
+    const clearBox = clear.querySelector('input');
+    clearBox.onchange = () => {
+      if (clearBox.checked) field.value = '';
+      field.disabled = clearBox.checked;
+    };
+    return {
+      el: h('div', {}, label(name, title, field), exists ? clear : null),
+      get: () => { const value = field.value.trim(); return { action: clearBox.checked ? 'clear' : value ? 'replace' : 'keep', value }; },
+    };
+  }
+
+  function backend(slot) {
+    const name = 'backend-' + slot;
+    const input = h('select', { id: 'realtime-' + name },
+      h('option', { value: 'assist' }, 'Home Assistant Assist'),
+      h('option', { value: 'openai', disabled: !saved.available }, 'OpenAI Realtime'));
+    input.value = saved.backend[slot];
+    const word = saved.wake_words[slot];
+    const title = 'Assistant ' + (slot + 1) + (word ? ' · ' + word : '');
+    const hint = word ? null : slot === 0 ? 'Action button' : 'Choose Wake word 2 in Home Assistant to use this slot.';
+    return { input, el: label(name, title, input, hint) };
+  }
+
+  async function check(kind) {
+    const result = kind === 'openai' ? openaiStatus : haStatus;
+    const title = kind === 'openai' ? 'OpenAI Realtime' : 'Home Assistant tools';
+    const fields = kind === 'openai' ? 'endpoint, model, and API key' : 'address and credentials';
+    result.textContent = `Testing ${title}…`;
+    try {
+      const { status } = (await echo.call('POST', '/api/realtime/test/' + kind)).json();
+      result.textContent = status === 'ok' ? `${title} verified` :
+        status === 'not_configured' ? `${title} credentials are missing` : `${title} test failed. Check the ${fields}.`;
+    } catch (e) { result.textContent = errText(e); }
+  }
+
+  function draw() {
+    const slot1 = backend(0), slot2 = backend(1);
+    const language = text('language', saved.language, 31, 'Automatic');
+    const instructions = h('textarea', { id: 'realtime-instructions', rows: 4, maxlength: 2047 });
+    instructions.value = saved.instructions;
+    const idle = number('idle', saved.idle_seconds, 1, 120);
+    const sensitivity = number('sensitivity', saved.sensitivity, 0, 100);
+    const talkOver = checkbox('barge', 'Talk over replies', saved.barge_in);
+    const barge = talkOver.querySelector('input');
+    const sensitivityRow = label('sensitivity', 'Talk-over sensitivity', sensitivity);
+    const playback = saved.voip_audio_supported ? choice('playback-stream', saved.playback_stream,
+      [['tts', 'TTS'], ['voip', 'VoIP']]) : null;
+    const microphone = saved.hfp_audio_supported ? choice('microphone-mode', saved.microphone_mode,
+      [['asr', 'micAsr'], ['hfp', 'micHfp'], ['hfp_asr_recovery', 'micHfp with micAsr interruption recovery']]) : null;
+    const micHint = h('p', { class: 'help', 'aria-live': 'polite' });
+    const openai = openaiOptions(
+      playback ? label('playback-stream', 'Playback stream', playback, 'VoIP engages the Echo’s call playback path.') : null,
+      microphone ? label('microphone-mode', 'Microphone mode', [microphone, micHint]) : null);
+    const updateBarge = () => {
+      const usingHfp = !!microphone && microphone.value !== 'asr';
+      const usingCallPath = usingHfp && playback?.value === 'voip';
+      sensitivity.disabled = !barge.checked || usingCallPath;
+      sensitivityRow.classList.toggle('hidden', sensitivity.disabled);
+      const hints = ['The first request uses micAsr. This mode applies from the first reply.'];
+      if (usingHfp && !usingCallPath) hints.push('With TTS playback, micHfp runs without the VoIP playback path.');
+      if (microphone?.value === 'hfp_asr_recovery') hints.push(barge.checked ?
+        'During an interruption, micHfp stays live. After you finish, HassMic joins up to 1,000 ms of buffered micAsr audio to the micHfp recording.' :
+        'Enable Talk over replies to use interruption recovery.');
+      micHint.textContent = hints.join(' ');
+    };
+    barge.onchange = updateBarge;
+    if (playback) playback.onchange = updateBarge;
+    if (microphone) microphone.onchange = updateBarge;
+    updateBarge();
+
+    const endpoint = text('endpoint', saved.endpoint, 511);
+    const haEndpoint = text('ha-endpoint', saved.ha_endpoint, 511, 'https://homeassistant.example/api/mcp/assist');
+    const key = secret('key', 'OpenAI API key', saved.api_key_set, 511);
+    const token = secret('ha-token', 'Home Assistant token', saved.ha_token_set, 2400);
+    openaiStatus = h('p', { class: 'help', role: 'status' });
+    haStatus = h('p', { class: 'help', role: 'status' });
+    const probe = (kind, ready, caption) => h('button', { type: 'button', disabled: !ready, onclick: async (e) => {
+      const button = e.currentTarget;
+      button.disabled = true;
+      try { await check(kind); } finally { button.disabled = false; }
+    } }, caption);
+    const tools = h('details', { open: !!(saved.ha_endpoint || saved.ha_token_set) }, h('summary', {}, 'Home Assistant tools'),
+      h('div', { class: 'realtime-fields' },
+        label('ha-endpoint', 'MCP endpoint', haEndpoint, 'Leave empty to disable device control.'),
+        token.el, h('div', { class: 'btns' }, probe('home-assistant', !!(saved.ha_endpoint && saved.ha_token_set), 'Test saved HA tools')),
+        haStatus));
+    const advanced = h('details', {}, h('summary', {}, 'Advanced'),
+      h('div', { class: 'realtime-fields' }, label('endpoint', 'OpenAI WebSocket endpoint', endpoint), sensitivityRow));
+
+    status = h('p', { class: 'help', role: 'status' });
+    form = h('form', { id: 'realtime-form', onsubmit: (e) => { e.preventDefault(); submit(false); } },
+      h('div', { class: 'realtime-slots' }, slot1.el, slot2.el),
+      saved.available ? null : h('p', { class: 'help' }, 'OpenAI Realtime requires ESPHome mode and local wake-word detection.'),
+      h('h3', {}, 'OpenAI Realtime'),
+      key.el, openai.sections,
+      label('language', 'Language', language, 'For example pl-PL.'),
+      label('instructions', 'Instructions', instructions),
+      label('idle', 'End after silence (seconds)', idle),
+      talkOver, advanced,
+      h('div', { class: 'btns' }, probe('openai', saved.api_key_set, 'Test saved OpenAI connection')),
+      openaiStatus, tools, status);
+    inputs = { slot1, slot2, openai, language, instructions, idle, sensitivity, barge, playback, microphone, endpoint, haEndpoint, key, token };
+    m.body.replaceChildren(form);
+    save = h('button', { type: 'submit', form: 'realtime-form', class: 'primary' }, 'Save');
+    saveTest = h('button', { type: 'button', onclick: () => submit(true) }, 'Save & test');
+    m.foot.replaceChildren(h('button', { type: 'button', onclick: () => m.dlg.close() }, 'Close'), saveTest, save);
+  }
+
+  async function submit(test) {
+    if (busy || !form.reportValidity()) return;
+    const { slot1, slot2, openai, language, instructions, idle, sensitivity, barge, playback, microphone, endpoint, haEndpoint, key, token } = inputs;
+    const k = key.get(), t = token.get();
+    const words = enc.encode(instructions.value);
+    if (words.length > 2047) { status.textContent = 'Instructions must fit in 2047 UTF-8 bytes.'; return; }
+    const profile = {
+      revision: saved.revision, backend: [slot1.input.value, slot2.input.value],
+      ...openai.profile(), language: language.value.trim(), instructions_hex: hex(words),
+      idle_seconds: +idle.value, sensitivity: sensitivity.disabled ? saved.sensitivity : +sensitivity.value, barge_in: barge.checked,
+      endpoint: endpoint.value.trim(), ha_endpoint: haEndpoint.value.trim(),
+      api_key_action: k.action, ha_token_action: t.action,
+    };
+    if (playback) profile.playback_stream = playback.value;
+    if (microphone) profile.microphone_mode = microphone.value;
+    busy = save.disabled = saveTest.disabled = true;
+    status.textContent = 'Saving…';
+    try {
+      saved = (await echo.call('POST', '/api/realtime', (ctr) => {
+        if (k.value || t.value) {
+          const keyBytes = enc.encode(k.value), tokenBytes = enc.encode(t.value);
+          const clear = new Uint8Array(Math.ceil((keyBytes.length + tokenBytes.length + 2) / 64) * 64);
+          clear.set(keyBytes); clear.set(tokenBytes, keyBytes.length + 1);
+          profile.secret_box = hex(seal(echo.k, ctr, clear));
+          keyBytes.fill(0); tokenBytes.fill(0); clear.fill(0);
+        }
+        return JSON.stringify(profile);
+      })).json();
+      draw();
+      save.disabled = saveTest.disabled = true;
+      status.textContent = 'Saved. Changes apply to the next voice session.';
+      if (test) {
+        const tests = [];
+        if (saved.api_key_set) tests.push(check('openai'));
+        if (saved.ha_token_set && saved.ha_endpoint) tests.push(check('home-assistant'));
+        await Promise.all(tests);
+      }
+    } catch (e) { status.textContent = errText(e); }
+    finally { busy = save.disabled = saveTest.disabled = false; }
+  }
+
+  draw();
+  m.show();
 }
 
 // ---------------------------------------------------------------- Wi-Fi (wifi.c; root's scripts/device/wifi.sh scans and switches)

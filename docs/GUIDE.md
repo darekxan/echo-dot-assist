@@ -217,6 +217,44 @@ The second word runs a second copy of its engine all the time. With Amazon's eng
 as the first, so the Echo works harder while it listens: not measured on an Echo yet (on the PC's emulator of the
 Echo, about two thirds more for hassmic as a whole). Leave "Wake word 2" at "No wake word" if you need only one.
 
+### OpenAI Realtime
+
+On the Echo settings page, open **Voice → Voice assistants**. Choose **OpenAI Realtime** for one or both local wake-word
+slots. Both slots start on **Home Assistant Assist**. Choose the wake words on the Echo's Home Assistant device page.
+Realtime uses the Echo's microphone, speaker and wake engine, and connects directly to OpenAI over a verified
+WebSocket. It is available in ESPHome mode with local wake detection.
+
+Enter your OpenAI API key, choose the model and voice, and use **Save & test**. The OpenAI endpoint defaults to the
+public API. The Echo needs DNS, outbound HTTPS and a valid clock. Give a replacement credential or clear the existing
+one when changing its endpoint. The keys stay on this Echo and are excluded from settings exports.
+
+Set the reply language and instructions or leave them at their defaults. Set reasoning effort on models that support
+it, cap output tokens if needed, or choose input noise reduction. **Normal** turn detection uses threshold, prefix
+padding and duration of silence. **Semantic** turn detection waits for a complete utterance and offers an eagerness
+setting.
+
+**Talk over replies** keeps the microphone active during playback and stops the reply when the Echo hears you. On
+Cannoli, HassMic uses the reply audio to suppress echo before microphone gain. Adjust sensitivity on the Echo if your
+room or speaker level calls for it. The action button ends an open Realtime session. The silence timeout returns the
+Echo to wake-word listening. Changes take effect on the next session.
+
+On Cannoli, **Voice assistants → Audio** has two independent settings for the next Realtime session.
+
+- **Playback stream** chooses **TTS** or **VoIP** for the speaker. VoIP engages the stock call playback path.
+- **Microphone mode** chooses **micAsr**, **micHfp**, or **micHfp with micAsr interruption recovery**. `micAsr` supplies
+  the wake word and first request. The selected mode takes over from the first reply. If `micHfp` is unavailable,
+  HassMic uses `micAsr`. You can use `micHfp` with either playback stream.
+
+In recovery mode with **Talk over replies** on, OpenAI detects interruptions on `micHfp`. HassMic cuts playback and
+keeps sending `micHfp`. When you finish speaking, HassMic submits one recovered turn with up to 1,000 ms of buffered
+`micAsr` audio leading into the `micHfp` audio from the interruption onward. The local **Talk-over sensitivity** setting
+applies to `micAsr` microphone mode and to each mode that uses TTS playback. New setups default to **TTS** and **micAsr**.
+
+To control devices, give the Echo a Home Assistant MCP endpoint such as
+`https://homeassistant.example/api/mcp/assist` and its access token. **Test saved HA tools** verifies tool discovery
+independently of OpenAI. Use Home Assistant's voice exposure controls to choose which devices and scripts are offered.
+A private LAN URL may use HTTP. The test and runtime use the saved endpoint and credential.
+
 ### Home Assistant's
 
 The Echo stops listening itself and streams its microphone to Home Assistant all the time, whose wake word engine

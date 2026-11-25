@@ -85,6 +85,7 @@
 #include "screen.h"
 #include "board.h"
 #include "core.h"
+#include "realtime.h"
 #include "micgain.h"
 #include "hash.h"
 #include "https.h"
@@ -1496,6 +1497,7 @@ static void mute_changed(int muted) { (void)muted; send_setting(KEY_MUTE); setti
 static void wake_event(const char *event);
 static void on_event(const unsigned char *p, const unsigned char *end)
 {
+    if (core_realtime_active()) return;
     struct pbf f, g; unsigned type = 0; char key[48], val[1024], text[512] = "", said[1024] = "", code[48] = ""; int cont = 0, stream_now = 0;
     while (pb_next(&p, end, &f)) {
         if (f.field == 1) type = f.v;
@@ -1787,6 +1789,7 @@ static int handle(unsigned type, const unsigned char *p, size_t len)
 {
     const unsigned char *end = p + len; struct pbf f; int keep = 1;
     if (type == VA_AUDIO) {                             /* TTS stream: no lock, just queue */
+        if (core_realtime_active()) return 1;
         while (pb_next(&p, end, &f)) if (f.field == 1 && f.data) core_tts_data(f.data, f.len);
         return 1;
     }
@@ -1919,6 +1922,7 @@ static int handle(unsigned type, const unsigned char *p, size_t len)
         core_link(1, sub);
     } break;
     case VA_RESPONSE:
+        if (core_realtime_active()) break;
         while (pb_next(&p, end, &f)) if (f.field == 2 && f.v) { fprintf(stderr, "pipeline refused\n"); core_error(); }
         break;
     case VA_EVENT:         on_event(p, end); break;

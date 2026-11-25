@@ -12,11 +12,18 @@ struct ws { int fd, client; uint8_t *buf; size_t cap; pthread_mutex_t wlock; };
 
 int  ws_accept(struct ws *w, int fd, char *path, size_t pathsz);           /* server side; path of the GET, may be NULL */
 int  ws_connect(struct ws *w, const char *host, int port, const char *path);
+/* Upgrade on an established stream. Takes ownership of fd, including on failure. */
+int  ws_upgrade_client(struct ws *w, int fd, const char *authority, const char *path,
+                       const char *headers, int timeout_ms);
 int  ws_send(struct ws *w, int opcode, const void *data, size_t len);
 /* 1 = complete message (fragments joined, NUL appended, *data valid until the next call), 2 = one beyond 4 MB, read
  * and dropped (*data: its first 256 bytes), 0 = closed, -1 = error.
  * Ping is answered, close is echoed. */
 int  ws_recv(struct ws *w, int *opcode, uint8_t **data, size_t *len);
+/* 1 = complete message, 0 = idle timeout, -1 = closed, oversized or invalid message.
+ * frame_timeout_ms bounds a message once its first bytes are ready. */
+int  ws_recv_timed(struct ws *w, int timeout_ms, int frame_timeout_ms,
+                   int *opcode, uint8_t **data, size_t *len);
 void ws_close(struct ws *w);
 void ws_random(void *out, size_t len);
 #endif

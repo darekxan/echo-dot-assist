@@ -2,7 +2,11 @@
 #include "resample.h"
 #include "audio.h"
 #include "board.h"
+#include "realtime.h"
+#include <dlfcn.h>
+#include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -65,6 +69,40 @@ void audio_call_gain(float g) { atomic_store(&call_q16, q16(g)); }
  * The gain glides (resample.c gain_glide), from the target at each open: a step from one buffer to the next clicked */
 static float gain_of(atomic_int *q) { return (float)atomic_load(q) / 65536; }
 static float play_g; static unsigned play_per_s;
+static MixerHandle realtime_voip;
+static int (*voip_resume)(MixerHandle);
+static float realtime_voip_g;
+static int realtime_voip_drained;
+enum voip_owner { VOIP_FREE, VOIP_DROP_IN, VOIP_REALTIME };
+static enum voip_owner active_voip_owner;
+static pthread_mutex_t voip_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t voip_available = PTHREAD_COND_INITIALIZER;
+
+static int claim_voip(enum voip_owner owner)
+{
+    pthread_mutex_lock(&voip_lock);
+    /* Drop In asks the core to stop the Realtime session after starting its workers. */
+    if (owner == VOIP_DROP_IN && active_voip_owner == VOIP_REALTIME) {
+        struct timespec until;
+        if (!clock_gettime(CLOCK_REALTIME, &until)) {
+            until.tv_sec += 2;
+            while (active_voip_owner == VOIP_REALTIME &&
+                   !pthread_cond_timedwait(&voip_available, &voip_lock, &until)) {}
+        }
+    }
+    int acquired = active_voip_owner == VOIP_FREE;
+    if (acquired) active_voip_owner = owner;
+    pthread_mutex_unlock(&voip_lock);
+    return acquired;
+}
+
+static void release_voip(void)
+{
+    pthread_mutex_lock(&voip_lock);
+    active_voip_owner = VOIP_FREE;
+    pthread_cond_signal(&voip_available);
+    pthread_mutex_unlock(&voip_lock);
+}
 
 int play_open(unsigned rate, unsigned channels)
 {
@@ -73,20 +111,38 @@ int play_open(unsigned rate, unsigned channels)
     return play ? 0 : -1;
 }
 
-int play_write(const void *data, size_t len)
+static int write_reply(MixerHandle link, unsigned per_s, float *gain, const void *data, size_t len, int realtime)
 {
+    if (!link) return -1;
     const char *p = data;
+    int16_t reference[REALTIME_RATE / 50];         /* core_realtime_audio submits at most 20 ms */
     while (len) {
         int status = 0; unsigned capb = 0;
-        char *buf = MixerGetBufPlay(play, &status, &capb);
+        char *buf = MixerGetBufPlay(link, &status, &capb);
         if (!buf) return -1;
         unsigned n = (len < capb ? len : capb) & ~1u;              /* whole samples: the gain works on s16 */
+        if (realtime && !n) { MixerReleaseBufPlay(link, 0); return -1; }
         if (!n) n = len < capb ? len : capb;
-        gain_glide(buf, p, n, play_per_s, &play_g, gain_of(&tts_q16));
-        MixerReleaseBufPlay(play, n);
+        gain_glide(buf, p, n, per_s, gain, gain_of(&tts_q16));
+        int tap = audio_realtime_rendered && n && !(n % sizeof *reference) && n <= sizeof reference;
+        unsigned queued = UINT_MAX;
+        if (tap) {
+            memcpy(reference, buf, n);           /* the shared slot can be recycled after release */
+            queued = MixerGetNumBytes(link);     /* measure after any wait for the writable slot */
+        }
+        int released = MixerReleaseBufPlay(link, n);
+        if (realtime && released < 0) return -1;
+        if (tap && released == 0)
+            audio_realtime_rendered(reference, n / sizeof *reference,
+                                     queued == UINT_MAX || queued % sizeof *reference ? UINT_MAX : queued / sizeof *reference);
         p += n; len -= n;
     }
     return 0;
+}
+
+int play_write(const void *data, size_t len)
+{
+    return write_reply(play, play_per_s, &play_g, data, len, audio_realtime_rendered != NULL);
 }
 
 void play_close(int drain)
@@ -95,6 +151,84 @@ void play_close(int drain)
     if (drain) MixerDrain(play); else MixerFlush(play);
     MixerClose(play);
     play = NULL;
+}
+
+static int drain_reply(MixerHandle link, int (*keep_draining)(void *), void *arg)
+{
+    /* MixerDrain starts draining. Closing the shared stream too soon drops its last samples. */
+    if (keep_draining(arg) && MixerDrain(link) >= 0) {
+        for (unsigned elapsed = 0; elapsed < 2000 && keep_draining(arg); elapsed += 10) {
+            unsigned queued = MixerGetNumBytes(link);
+            if (!queued) return 1;
+            if (queued == UINT_MAX) break;
+            usleep(10000);
+        }
+    }
+    if (keep_draining(arg)) fprintf(stderr, "play: realtime mixer did not drain\n");
+    return 0;
+}
+
+int play_close_realtime(int (*keep_draining)(void *), void *arg)
+{
+    if (!play) return 1;
+    int drained = drain_reply(play, keep_draining, arg);
+    if (!drained) MixerFlush(play);
+    MixerClose(play);
+    play = NULL;
+    return drained;
+}
+
+int realtime_voip_supported(void) { return !strcmp(board.codename, "cannoli"); }
+
+int realtime_voip_open(void)
+{
+    if (realtime_voip) return 0;
+    if (!realtime_voip_supported()) return -1;
+    /* Resume is only needed for native Realtime on Cannoli. Other mixers and the build stubs need no export. */
+    voip_resume = (int (*)(MixerHandle))dlsym(RTLD_DEFAULT, "MixerResume");
+    if (!voip_resume || !claim_voip(VOIP_REALTIME)) return -1;
+    realtime_voip = MixerOpenPlay(REALTIME_RATE, 1, 16, MIXER_PLAY_VOIP);
+    if (!realtime_voip) { release_voip(); return -1; }
+    realtime_voip_g = gain_of(&tts_q16);
+    realtime_voip_drained = 0;
+    return 0;
+}
+
+int realtime_voip_write(const void *data, size_t len)
+{
+    if (!realtime_voip || len % sizeof(int16_t)) return -1;
+    if (!len) return 0;
+    if (realtime_voip_drained) {
+        if (voip_resume(realtime_voip) != 1) return -1;
+        realtime_voip_drained = 0;
+    }
+    return write_reply(realtime_voip, REALTIME_RATE, &realtime_voip_g, data, len, 1);
+}
+
+int realtime_voip_flush(void)
+{
+    /* Cannoli's Flush and Resume return true when the daemon reaches the requested state. */
+    if (!realtime_voip || MixerFlush(realtime_voip) != 1 || voip_resume(realtime_voip) != 1) return -1;
+    realtime_voip_g = gain_of(&tts_q16);
+    realtime_voip_drained = 0;
+    return 0;
+}
+
+int realtime_voip_drain(int (*keep_draining)(void *), void *arg)
+{
+    if (!realtime_voip) return 0;
+    int drained = drain_reply(realtime_voip, keep_draining, arg);
+    realtime_voip_drained = drained;
+    return drained;
+}
+
+void realtime_voip_close(void)
+{
+    if (!realtime_voip) return;
+    MixerFlush(realtime_voip);
+    MixerClose(realtime_voip);
+    realtime_voip = NULL;
+    release_voip();
 }
 
 /* Music streams (Sendspin, Bluetooth speaker).  The mixer's buffer fill is not exposed in a documented way, so the queue
@@ -159,45 +293,92 @@ int       bt_open(unsigned rate, unsigned channels) { return s_open(&bt, rate, c
 long long bt_queued_us(void) { return s_queued_us(&bt); }
 int       bt_write(const void *data, size_t len) { return s_write(&bt, data, len); }
 void      bt_close(void) { s_close(&bt); }
-int       voip_open(unsigned rate, unsigned channels) { return s_open(&voip, rate, channels, MIXER_PLAY_VOIP); }
+int voip_open(unsigned rate, unsigned channels)
+{
+    if (!claim_voip(VOIP_DROP_IN)) return -1;
+    int rc = s_open(&voip, rate, channels, MIXER_PLAY_VOIP);
+    if (rc) release_voip();
+    return rc;
+}
 long long voip_queued_us(void) { return s_queued_us(&voip); }
 int       voip_write(const void *data, size_t len) { return s_write(&voip, data, len); }
-void      voip_close(void) { s_close(&voip); }
+void voip_close(void)
+{
+    if (!voip.h) return;
+    s_close(&voip);
+    release_voip();
+}
 
 /* micHfp: a stream of its own beside micAsr (the mixer gives each type to one client).  Only where it was measured to
  * carry the call path (board.call_mic): the Echo 2 and the Echo Dot 5 have one in AFE.cfg, untried */
-static MixerHandle callmic; static int callmic_held;
-int callmic_present(void) { return board.call_mic; }
-int callmic_open(void)
+struct hfp_capture { MixerHandle link; int held; };
+static struct hfp_capture callmic, realtime_hfp;
+static atomic_int hfp_claimed;
+
+static int hfp_format(MixerHandle link)
 {
-    if (callmic) return 0;
-    callmic = MixerOpenRec("micHfp");
-    if (!callmic) return -1;
-    /* record streams answer -1 to the getters (mixcap.c); micHfp was measured at 16 kHz mono pcm16 (2026-11-13).  Only a
-     * format it does report, and another one, is refused */
-    int rate = (int)MixerGetRate(callmic), ch = (int)MixerGetNumCh(callmic), bits = (int)MixerGetSampleSizeBits(callmic);
+    /* The mixer can report -1 until the stream starts. Refuse a format if it reports a different one. */
+    int rate = (int)MixerGetRate(link), ch = (int)MixerGetNumCh(link), bits = (int)MixerGetSampleSizeBits(link);
     if ((rate > 0 && rate != CAP_RATE) || (ch > 0 && ch != 1) || (bits > 0 && bits != 16)) {
         fprintf(stderr, "audio: micHfp is %d Hz, %d ch, %d bits: not ours\n", rate, ch, bits);
-        MixerClose(callmic); callmic = NULL; return -1;
+        return -1;
     }
     return 0;
 }
-int callmic_read(const void **data)
+
+static void hfp_close(struct hfp_capture *capture)
+{
+    if (!capture->link) return;
+    if (capture->held) MixerReleaseBufRec(capture->link);
+    MixerClose(capture->link);
+    capture->link = NULL; capture->held = 0;
+    atomic_store(&hfp_claimed, 0);
+}
+
+static int hfp_open(struct hfp_capture *capture)
+{
+    if (capture->link) return 0;
+    if (atomic_exchange(&hfp_claimed, 1)) return -1;
+    capture->link = MixerOpenRec(MIXER_REC_HFP);
+    if (!capture->link) { atomic_store(&hfp_claimed, 0); return -1; }
+    if (hfp_format(capture->link)) { hfp_close(capture); return -1; }
+    return 0;
+}
+
+static int hfp_read(struct hfp_capture *capture, const void **data)
 {
     int status = 0; unsigned n = 0;
-    if (!callmic) return -1;
-    if (callmic_held) { MixerReleaseBufRec(callmic); callmic_held = 0; }
-    void *p = MixerGetBufRec(callmic, &status, &n);
+    if (!capture->link) return -1;
+    if (capture->held) { MixerReleaseBufRec(capture->link); capture->held = 0; }
+    void *p = MixerGetBufRec(capture->link, &status, &n);
     if (!p) return 0;
-    callmic_held = 1; *data = p;
+    capture->held = 1; *data = p;
     return (int)n;
 }
-void callmic_close(void)
+
+int  callmic_present(void) { return board.call_mic; }
+int  callmic_open(void) { return hfp_open(&callmic); }
+int  callmic_read(const void **data) { return hfp_read(&callmic, data); }
+void callmic_close(void) { hfp_close(&callmic); }
+
+static int realtime_hfp_checked;
+int realtime_hfp_open(void)
 {
-    if (callmic_held) MixerReleaseBufRec(callmic);
-    if (callmic) MixerClose(callmic);
-    callmic = NULL; callmic_held = 0;
+    realtime_hfp_checked = 0;
+    return realtime_voip_supported() ? hfp_open(&realtime_hfp) : -1;
 }
+int realtime_hfp_read(const void **data)
+{
+    int n = hfp_read(&realtime_hfp, data);
+    if (n <= 0) return n;
+    if (n & 1) return -1;
+    if (!realtime_hfp_checked) {
+        if (hfp_format(realtime_hfp.link)) return -1;
+        realtime_hfp_checked = 1;
+    }
+    return n;
+}
+void realtime_hfp_close(void) { hfp_close(&realtime_hfp); }
 
 static int always(void) { return 1; }
 void (*audio_earcon_started)(unsigned lead_ms);

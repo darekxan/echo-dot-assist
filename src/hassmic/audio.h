@@ -16,6 +16,10 @@ int  play_open(unsigned rate, unsigned channels);
 int  play_write(const void *data, size_t len);      /* blocks at playback speed */
 void audio_tts_gain(float gain);                    /* as audio_music_gain (below), for this stream: replies */
 void play_close(int drain);
+int play_close_realtime(int (*keep_draining)(void *), void *arg);
+/* Set by the playback thread only during Realtime writes. Backends call it with the gain-scaled
+ * mono 24 kHz PCM they published; queued_frames is the earlier data in the mixer, or UINT_MAX. */
+extern void (*audio_realtime_rendered)(const int16_t *pcm, size_t frames, unsigned queued_frames);
 
 /* Second, independent playback stream for music (Sendspin); mixes with the voice stream.  One at a time.
  * music_write blocks while the device buffer is full; music_queued_us is how much written audio has not played yet. */
@@ -69,6 +73,19 @@ void      callmic_close(void);
 int       voip_write(const void *data, size_t len);
 long long voip_queued_us(void);
 void      voip_close(void);
+
+/* Realtime's optional Cannoli call path, separate from Drop In. One playback worker owns the mono 24 kHz stream.
+ * Drain returns 1 if heard, 0 if cut or failed (the caller can then flush). Both keep the stream open. */
+int  realtime_voip_supported(void);
+int  realtime_voip_open(void);
+int  realtime_voip_write(const void *data, size_t len);
+int  realtime_voip_drain(int (*keep_draining)(void *), void *arg);
+int  realtime_voip_flush(void);
+void realtime_voip_close(void);
+/* One capture worker owns the mono 16 kHz micHfp stream, with the same buffer lifetime as cap_read. */
+int  realtime_hfp_open(void);
+int  realtime_hfp_read(const void **data);
+void realtime_hfp_close(void);
 
 /* Volume, 0..100.  VOL_MAIN: music, sounds and calls (what the keys move); VOL_TTS: the assistant's replies; VOL_MUTE:
  * a global mute the backend keeps (1 = set; nothing of ours sets it, main.c clears it).  vol_read gives fallback when

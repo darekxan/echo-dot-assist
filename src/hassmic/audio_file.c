@@ -4,8 +4,10 @@
  * two reflections: what Amazon's echo canceller leaves of them on an Echo (earsup.h). */
 #include "resample.h"
 #include "audio.h"
+#include "realtime.h"
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +17,7 @@
 static FILE *cap, *play;
 static short block[800];
 static unsigned play_rate, play_ch;
+static uint64_t play_echo_cursor;           /* simulated playback position, in playback frames */
 void (*audio_earcon_started)(unsigned lead_ms);
 
 #define ECHO_LEN (16000 * 4)
@@ -22,21 +25,43 @@ static pthread_mutex_t echo_mu = PTHREAD_MUTEX_INITIALIZER;
 static float echo[ECHO_LEN];                /* by capture sample, modulo */
 static unsigned long long cap_pos;          /* samples cap_read has handed out */
 
-static void echo_add(const short *pcm, size_t samples, unsigned rate)
+static unsigned echo_add(const short *pcm, size_t samples, unsigned rate, uint64_t *cursor)
 {
     const char *e = getenv("HASSMIC_FAKE_ECHO"); int ms; float db;
-    if (!e || sscanf(e, "%d:%f", &ms, &db) != 2 || !rate) return;
-    float g = powf(10, db / 20) / 32768;
+    int enabled = e && sscanf(e, "%d:%f", &ms, &db) == 2;
+    if (!rate || (!enabled && !cursor)) return 0;
+    float g = enabled ? powf(10, db / 20) / 32768 : 0;
     pthread_mutex_lock(&echo_mu);
-    unsigned long long at = cap_pos + (unsigned long long)ms * 16;
-    size_t n = (size_t)(samples * 16000ULL / rate);
-    for (size_t j = 0; j < n && j < ECHO_LEN / 2; j++) {
-        float v = pcm[j * rate / 16000] * g;            /* every rate/16000-th sample: the earcons are tones far under 8 kHz */
-        echo[(at + j) % ECHO_LEN] += v;
-        echo[(at + j + 48) % ECHO_LEN] += 0.5f * v;       /* reflections at 3 and 10 ms */
-        echo[(at + j + 160) % ECHO_LEN] += 0.25f * v;
+    uint64_t at = cap_pos, first_play = 0, first_cap = 0;
+    size_t n = samples * (uint64_t)CAP_RATE / rate;
+    unsigned queued = 0;
+    if (cursor) {
+        /* Playback writes can be shorter than a capture block. Continue at the previous block's end
+         * if the simulated capture clock has not reached it, keeping sample phase across writes. */
+        uint64_t now = cap_pos * rate / CAP_RATE;
+        first_play = *cursor > now ? *cursor : now;
+        queued = (unsigned)(first_play - now);
+        *cursor = first_play + samples;
+        first_cap = (first_play * CAP_RATE + rate - 1) / rate;
+        n = (*cursor * CAP_RATE + rate - 1) / rate - first_cap;
+        at = first_cap;
+    }
+    if (enabled) {
+        at += (uint64_t)ms * (CAP_RATE / 1000);
+        for (size_t j = 0; j < n && j < ECHO_LEN / 2; j++) {
+            uint64_t phase = (first_cap + j) * rate - first_play * CAP_RATE;
+            size_t i = (size_t)(phase / CAP_RATE);
+            float sample = pcm[i];
+            if (cursor && i + 1 < samples)
+                sample += (pcm[i + 1] - sample) * (phase % CAP_RATE) / CAP_RATE;
+            float v = sample * g;
+            echo[(at + j) % ECHO_LEN] += v;
+            echo[(at + j + 48) % ECHO_LEN] += 0.5f * v;   /* reflections at 3 and 10 ms */
+            echo[(at + j + 160) % ECHO_LEN] += 0.25f * v;
+        }
     }
     pthread_mutex_unlock(&echo_mu);
+    return queued;
 }
 
 int cap_open(void)
@@ -72,33 +97,141 @@ int play_open(unsigned rate, unsigned channels)
 {
     const char *p = getenv("HASSMIC_PLAY");
     play = fopen(p ? p : "/tmp/hassmic_play.raw", "ab");
-    play_rate = rate; play_ch = channels;
+    play_rate = rate; play_ch = channels; play_echo_cursor = 0;
     return play ? 0 : -1;
 }
 
-static float tts_gain = 1;                  /* tests: as the mixer would get it, and in the log */
+static _Atomic float tts_gain = 1;          /* same level as the mixer would get, also shown in the log */
 void audio_tts_gain(float g)
 {
-    if (fabsf(g - tts_gain) > 0.0005f) fprintf(stderr, "audio: tts gain %.3f\n", g);
-    tts_gain = g;
+    if (fabsf(g - atomic_load(&tts_gain)) > 0.0005f) fprintf(stderr, "audio: tts gain %.3f\n", g);
+    atomic_store(&tts_gain, g);
+}
+
+static int write_reply(FILE *out, unsigned rate, unsigned channels, uint64_t *cursor, const void *data, size_t len)
+{
+    if (!out) return -1;
+    float gain = atomic_load(&tts_gain);
+    int16_t reference[REALTIME_RATE / 50];
+    if (audio_realtime_rendered && rate == REALTIME_RATE && channels == 1 && len &&
+        !(len % sizeof *reference) && len <= sizeof reference) {
+        size_t frames = len / sizeof *reference;
+        memcpy(reference, data, len);
+        if (gain < 0.9995f)
+            for (size_t i = 0; i < frames; i++) reference[i] = (int16_t)lrintf(reference[i] * gain);
+        if (fwrite(reference, sizeof *reference, frames, out) != frames) return -1;
+        unsigned queued = echo_add(reference, frames, rate, cursor);
+        audio_realtime_rendered(reference, frames, queued);
+    } else if (gain < 0.9995f)
+        for (size_t i = 0; i + 1 < len; i += 2) {
+            short v;
+            memcpy(&v, (const char *)data + i, 2);
+            v = (short)lrintf(v * gain);
+            if (fwrite(&v, 2, 1, out) != 1) return -1;
+        }
+    else if (fwrite(data, 1, len, out) != len) return -1;
+    usleep((useconds_t)(len * 1e6 / (2.0 * channels * rate)));
+    return 0;
 }
 
 int play_write(const void *data, size_t len)
 {
-    if (tts_gain < 0.9995f)
-        for (size_t i = 0; i + 1 < len; i += 2) { short v; memcpy(&v, (const char *)data + i, 2); v = (short)lrintf(v * tts_gain); fwrite(&v, 2, 1, play); }
-    else fwrite(data, 1, len, play);
-    usleep((useconds_t)(len * 1e6 / (2.0 * play_ch * play_rate)));
-    return 0;
+    return write_reply(play, play_rate, play_ch, &play_echo_cursor, data, len);
 }
 
 void play_close(int drain) { (void)drain; if (play) fclose(play); play = NULL; }
+int play_close_realtime(int (*keep_draining)(void *), void *arg)
+{
+    int drain = keep_draining(arg);
+    play_close(drain);
+    return drain;
+}
+
+/* Explicitly enabled by tests. Separate raw files model call playback and the DSP's echo-clean capture. */
+static FILE *realtime_voip, *realtime_hfp;
+static uint64_t realtime_voip_cursor;
+
+int realtime_voip_supported(void)
+{
+    const char *enabled = getenv("HASSMIC_FAKE_VOIP");
+    return enabled && *enabled && strcmp(enabled, "0");
+}
+
+int realtime_voip_open(void)
+{
+    if (realtime_voip) return 0;
+    if (!realtime_voip_supported()) return -1;
+    const char *path = getenv("HASSMIC_FAKE_VOIP_PLAY");
+    realtime_voip = fopen(path ? path : "/tmp/hassmic_realtime_voip.raw", "ab");
+    if (!realtime_voip) return -1;
+    setvbuf(realtime_voip, NULL, _IONBF, 0);
+    realtime_voip_cursor = 0;
+    return 0;
+}
+
+int realtime_voip_write(const void *data, size_t len)
+{
+    if (len % sizeof(int16_t)) return -1;
+    return write_reply(realtime_voip, REALTIME_RATE, 1, &realtime_voip_cursor, data, len);
+}
+
+int realtime_voip_flush(void)
+{
+    if (!realtime_voip || fflush(realtime_voip)) return -1;
+    realtime_voip_cursor = 0;
+    return 0;
+}
+
+int realtime_voip_drain(int (*keep_draining)(void *), void *arg)
+{
+    if (!realtime_voip || !keep_draining(arg)) return 0;
+    /* Writes are paced, so the model has already played the submitted buffers. */
+    return 1;
+}
+
+void realtime_voip_close(void)
+{
+    if (!realtime_voip) return;
+    fclose(realtime_voip);
+    realtime_voip = NULL;
+}
+
+int realtime_hfp_open(void)
+{
+    if (realtime_hfp) return 0;
+    const char *path = getenv("HASSMIC_FAKE_HFP");
+    if (!realtime_voip_supported() || !path) return -1;
+    realtime_hfp = fopen(path, "rb");
+    if (!realtime_hfp) return -1;
+    setvbuf(realtime_hfp, NULL, _IONBF, 0);
+    return 0;
+}
+
+int realtime_hfp_read(const void **data)
+{
+    static short samples[CAP_RATE / 25];         /* Cannoli delivers 40 ms blocks */
+    if (!realtime_hfp) return -1;
+    const size_t count = sizeof samples / sizeof *samples;
+    size_t n = fread(samples, sizeof *samples, count, realtime_hfp);
+    if (ferror(realtime_hfp)) return -1;
+    if (n < count) { memset(samples + n, 0, (count - n) * sizeof *samples); rewind(realtime_hfp); }
+    usleep(40000);
+    *data = samples;
+    return sizeof samples;
+}
+
+void realtime_hfp_close(void)
+{
+    if (!realtime_hfp) return;
+    fclose(realtime_hfp);
+    realtime_hfp = NULL;
+}
 
 void play_earcon(const short *pcm, size_t samples, unsigned rate)
 {
     int peak = 0;                               /* for the tests: how loud (separate volumes turn our sounds down) */
     for (size_t i = 0; i < samples; i++) if (abs(pcm[i]) > peak) peak = abs(pcm[i]);
-    echo_add(pcm, samples, rate);
+    echo_add(pcm, samples, rate, NULL);
     if (audio_earcon_started) audio_earcon_started(0);
     fprintf(stderr, "earcon: %zu samples @ %u Hz, peak %d\n", samples, rate, peak);
 }
