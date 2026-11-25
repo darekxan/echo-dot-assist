@@ -166,7 +166,7 @@ enum { KEY_NOISE = 2, KEY_MIC_LEVEL, KEY_MULT, KEY_MUTE, KEY_WAKE_SOUND, KEY_SEN
        /* the light ring live (ringlive.h): four actions, the design select, then a light per LED (RING_LEDS_MAX keys:
         * a new key goes after KEY_LIVE_LED + RING_LEDS_MAX) */
        KEY_LIVE_FRAME, KEY_LIVE_ANIM, KEY_LIVE_DESIGN_SVC, KEY_LIVE_STOP, KEY_LIVE_DESIGN, KEY_LIVE_LED,
-       KEY_PLUGIN = KEY_LIVE_LED + RING_LEDS_MAX, KEY_MWW_DEPRECATED };
+       KEY_PLUGIN = KEY_LIVE_LED + RING_LEDS_MAX, KEY_MWW_DEPRECATED, KEY_BG_NOISE };
 enum { MP_KEY = 1, MP_IDLE = 1, MP_PLAYING = 2, MP_PAUSED = 3, MP_CMD_PLAY = 0, MP_CMD_PAUSE = 1, MP_CMD_STOP = 2, MP_CMD_MUTE = 3, MP_CMD_UNMUTE = 4 };
 /* A music plugin is listed (plugin.h plugin_has_music, docs/plugins.md 4.7): the media player offers pause and play
  * besides, for what the plugin plays; without one the features stay what they were */
@@ -532,6 +532,28 @@ static void send_sensor(int key, float v)   /* lock held */
     send_state(SENSOR_STATE, &b);
 }
 
+/* Subscriptions get an immediate state. Then report changes of at least 1 dB or a switch to or from unknown,
+ * at most once a second, with a five-second heartbeat. */
+static float sent_bg_noise = NAN;
+static long long bg_noise_at;
+
+static void send_background_noise(int initial)      /* lock held */
+{
+    if (!listed(KEY_BG_NOISE)) return;
+    float level = core_bg_noise();
+    int unknown = isnan(level);
+    int changed = unknown != isnan(sent_bg_noise) || (!unknown && fabsf(level - sent_bg_noise) >= 1);
+    long long now = now_ms(), elapsed = now - bg_noise_at;
+    if (!initial && (elapsed < 1000 || (!changed && elapsed < 5000))) return;
+    PB(b, 32);
+    pb_fixed32(&b, 1, KEY_BG_NOISE);
+    if (unknown) pb_uint(&b, 3, 1);                /* SensorStateResponse.missing_state */
+    else pb_float(&b, 2, level);
+    send_state(SENSOR_STATE, &b);
+    sent_bg_noise = level;
+    bg_noise_at = now;
+}
+
 /* ---------------------------------------------------------------- light sensor and LED brightness
  * Illuminance as stock reads it (core_lux) and the level the LED ring shows, which follows it while auto brightness is on
  * (core_led_brightness).  Polled every second, stock's rate once its engine has settled.  The sensor's integer lux flicker
@@ -563,6 +585,7 @@ static void *light_thread(void *arg)
                 && (!core_led_auto(-1) || (report && (abs(level - sent_level) >= 2 || now - level_at >= 300)))) {
                 send_setting(KEY_LED_BRIGHTNESS); sent_level = level; level_at = now;
             }
+            send_background_noise(0);
         }
         pthread_mutex_unlock(&core_lock);
     }
@@ -693,6 +716,7 @@ static int listed(int key)
     case KEY_LED_AUTO: return have_auto;
     case KEY_SCR_AUTO: case KEY_SCR_LEVEL: case KEY_SCR_ADJUST: return settings_find("screen_brightness_auto") != NULL;
     case KEY_LUX: return have_light && settings_on("light_sensor");
+    case KEY_BG_NOISE: return core_room_noise_sensor(-1);
     case KEY_LIGHT: return ring_custom() || ringlive_enabled();             /* the palette's, or drawn live */
     case KEY_RING_FILL: case KEY_RING_ROTATION: case KEY_RING_LEDS: return ring_per_led() || ringlive_enabled();
     case KEY_LIVE_FRAME: case KEY_LIVE_ANIM: case KEY_LIVE_DESIGN_SVC: case KEY_LIVE_STOP: case KEY_LIVE_DESIGN:
@@ -854,6 +878,11 @@ static void send_setting_entities(void)
     if (listed(KEY_ARB_PEERS)) {
         { PB(b, 128); pb_str(&b, 1, "arbitration_peers"); pb_fixed32(&b, 2, KEY_ARB_PEERS); pb_str(&b, 3, "Arbitration peers");
           pb_str(&b, 5, "mdi:access-point-network"); pb_uint(&b, 13, 2); send_msg(LIST_SENSOR, &b); }
+    }
+    if (listed(KEY_BG_NOISE)) {
+        PB(b, 192); pb_str(&b, 1, "background_noise_level"); pb_fixed32(&b, 2, KEY_BG_NOISE);
+        pb_str(&b, 3, "Background noise level"); pb_str(&b, 5, "mdi:waveform"); pb_str(&b, 6, "dBFS");
+        pb_uint(&b, 7, 1); pb_uint(&b, 10, 1); send_msg(LIST_SENSOR, &b);
     }
     /* Whisper detection (whisper.h): "{{ is_state('binary_sensor.<node>_last_request_whispered', 'on') }}" in the
      * conversation agent's prompt template, to have it answer in whispered speech tags */
@@ -1938,7 +1967,7 @@ static int handle(unsigned type, const unsigned char *p, size_t len)
     case LIST_ENTITIES_REQ: send_entities(); break;
     case SUBSCRIBE_STATES:
         for (int i = 0; i < MAX_CLIENTS; i++) if (clients[i].fd == reply_fd) clients[i].states = 1;
-        send_mp_state(); send_all_settings(); send_token_state(c); send_web_state();
+        send_mp_state(); send_all_settings(); send_background_noise(1); send_token_state(c); send_web_state();
         core_plugin_held_flush();       /* `synced` events that waited for a link of Home Assistant's (core.h) */
         ask_time(c, 1); break;
     case GET_TIME_RESP: {

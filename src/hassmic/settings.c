@@ -110,7 +110,7 @@ static int colour_actual(void)
 /* ---------------------------------------------------------------- the table */
 
 enum id { WAKE_ENGINE, SPEECH_LANG, WAKE_ADAPT, MIC_LEVEL, DENOISE, WAKE_SOUND, SOUND_TOUCH, SOUND_MICS_OFF, SOUND_MICS_ON, SOUND_VOLUME, SOUND_BT_ON, SOUND_BT_OFF, WAKE_SOUND_REMOVAL, MUTE, DND, TIMER_RING, TIMER_SOUND, TIMER_STOP_ANY, TIMER_STOP_OTHERS, STOP_ENDS, MULTI_PRESS, WAKE_IN_REQ, END_REQ, BT_ANNOUNCE, BT_LANG, LED_AUTO, LED_LEVEL, RING_ROT, BAND, MUSIC_PAGE, SCR_AUTO, SCR_LEVEL, SCR_ADJUST, SCR_COLOUR, SCREEN_TEXT, SCREEN_HOLD, SCREEN_TIMERS, SCR_SLEEP, SCR_CLOCK, SCR_MOTION_KEEP, SCR_MOTION_WAKE, ARB, ARB_MODE, ARB_AUTO, ARB_WINDOW, ARB_OFFSET, SOUND, WHISPER, WAKE_EVENTS, PLUGINS, COMMUNITY, REQUEST_TEXT, RING_LIVE, WIFI_MOTION,
-          WIFI_SENS, LIGHT_SENSOR, BT_PROXY, BT_AUDIO, BT_SPEAKER, BT_OUT_DELAY, BT_OUT_AWAKE, BT_OUT_STAY, DROPIN, DROPIN_ANSWER, CALL_MIC, UPDATES, HTTPS_VERIFY, KIOSK_NET, KIOSK_MIC, KIOSK_CAM, KIOSK_DLNA, SS_UNPAIRED, EQ_BASS, EQ_MID, EQ_TREBLE, SPK_GAIN, DUCK, DUCK_OTHERS, VOLUME, VOL_SPLIT,
+          WIFI_SENS, LIGHT_SENSOR, ROOM_NOISE_SENSOR, BT_PROXY, BT_AUDIO, BT_SPEAKER, BT_OUT_DELAY, BT_OUT_AWAKE, BT_OUT_STAY, DROPIN, DROPIN_ANSWER, CALL_MIC, UPDATES, HTTPS_VERIFY, KIOSK_NET, KIOSK_MIC, KIOSK_CAM, KIOSK_DLNA, SS_UNPAIRED, EQ_BASS, EQ_MID, EQ_TREBLE, SPK_GAIN, DUCK, DUCK_OTHERS, VOLUME, VOL_SPLIT,
           ASSIST_LINK, ASSIST_LEVEL, ASSIST_OFFSET, SOUNDS_LINK, SOUNDS_LEVEL, SOUNDS_OFFSET, TIMER_LINK, TIMER_LEVEL, TIMER_OFFSET,
           CALL_LINK, CALL_LEVEL, CALL_OFFSET,
           VOL_EVEN, NSET };
@@ -217,6 +217,7 @@ static const struct setting table[NSET] = {
     [WIFI_MOTION] = { "wifi_motion", "Wi-Fi motion (experimental)", "Features", NULL, S_BOOL, 0, 1, 1, 1 },
     [WIFI_SENS]   = { "wifi_motion_sensitivity", "Wi-Fi motion sensitivity", "Features", NULL, S_INT, WIFIMOTION_SENS_MIN, WIFIMOTION_SENS_MAX, 1, 0 },
     [LIGHT_SENSOR] = { "light_sensor", "Light sensor", "Features", NULL, S_BOOL, 0, 1, 1, 1 },
+    [ROOM_NOISE_SENSOR] = { "room_noise_sensor", "Background noise sensor", "Features", NULL, S_BOOL, 0, 1, 1, 1 },
     /* proto_esphome.c bt_proxy(): off, the device info names no proxy, so Home Assistant sets up no scanner, and
      * subscriptions and GATT requests are refused (issue #152).  Disabling the entities in Home Assistant leaves the
      * scanner running: the proxy is no entity.  Phones, the speaker and Improv keep the controller */
@@ -429,6 +430,7 @@ int settings_get(const struct setting *s)
     case BT_OUT_STAY: return bt_stay;
     case WHISPER: return whisper;
     case LIGHT_SENSOR: return light_sensor;
+    case ROOM_NOISE_SENSOR: return core_room_noise_sensor(-1);
     case WAKE_EVENTS: return wake_events;
     case PLUGINS: return plugins;
     case COMMUNITY: return community;
@@ -513,6 +515,7 @@ static void put(enum id i, int v)
         bt_speaker = v; a2dp_out_stay(bt_stay && v); if (!v && a2dp_out_enabled()) a2dp_out_enable(0); break;
     case WHISPER: whisper = v; core_whisper_enable(v); break;
     case LIGHT_SENSOR: light_sensor = v; break;
+    case ROOM_NOISE_SENSOR: core_room_noise_sensor(v); break;
     case WAKE_EVENTS: wake_events = v; break;
     /* (settings_load only notes these two: main.c told plugin.c and the store already, as this start ends up with
      * them, a preset's included, and settings_preset tells them once more at its end.  Told here, state/config's

@@ -100,6 +100,8 @@ void core_mic_off(void);                        /* server has heard enough */
 int  core_ha_linked(void);                     /* lock held: a client (Home Assistant) is connected */
 void core_settings_changed(void);
 void core_entities_changed(void);             /* lock held: a feature went on or off: the protocol lists its entities anew */
+int  core_room_noise_sensor(int set);          /* lock held; -1 queries the setting */
+float core_bg_noise(void);                     /* lock held; relative dBFS, NAN when unknown */
 int  core_whisper_model(void);                 /* a whisper model is loaded */
 int  core_sound_failed(void);                  /* sound detection's last start failed (its model did not load); any thread */
 void core_whisper_enable(int on);             /* whisper detection runs (with a model) */             /* lock held: settings.c changed one; the protocol shows it */

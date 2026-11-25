@@ -54,7 +54,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class Echo:
-    def __init__(self, part, config, again=None):
+    def __init__(self, part, config, again=None, *, cap=None):
         """again: an Echo stopped before, started anew on its state and mixer (a restart)"""
         self.port, self.web = PORT + 2 * part, PORT + 2 * part + 1
         if again: self.tmp, self.state, self.mixer = again.tmp, again.state, again.mixer
@@ -73,7 +73,8 @@ class Echo:
         # for both shared its offset: a read's seek(0) moved hassmic's next line to the file's start, over what was
         # there, and a value looked up last was an old one (volumes failed 3 runs in 20, upstream's 1 in 10)
         self.logpath = os.path.join(self.tmp, "log"); open(self.logpath, "w").close(); self.log = open(self.logpath, "a")
-        env = dict(os.environ, HASSMIC_STATE=self.state, HASSMIC_FAKE_MIXER=self.mixer, HASSMIC_CAP=f"{ROOT}/testdata/alexa_espeak.raw",
+        env = dict(os.environ, HASSMIC_STATE=self.state, HASSMIC_FAKE_MIXER=self.mixer,
+                   HASSMIC_CAP=cap if cap is not None else f"{ROOT}/testdata/alexa_espeak.raw",
                    HASSMIC_PLAY=os.path.join(self.tmp, "play.raw"), HASSMIC_MDNS_FILE=os.path.join(self.tmp, "mdns"),
                    HASSMIC_FAKE_ADDRS=os.path.join(self.tmp, "addrs"), HASSMIC_ARB_ADDR="127.255.255.255",
                    HASSMIC_MODELS=os.path.join(self.tmp, "models"), HASSMIC_LED_ROOT=os.path.join(self.tmp, "etc"),
@@ -551,4 +552,5 @@ async def main():
     sys.exit(1 if check.failed else 0)
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

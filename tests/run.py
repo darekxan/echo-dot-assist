@@ -45,6 +45,7 @@ TESTS = [
     ("wifi", [PY, "tests/fake_web_wifi.py"]),
     ("wifi-join", [PY, "tests/fake_wifi_join.py"]),
     ("volumes", [PY, "tests/fake_ha_volumes.py"]),
+    ("room-noise", [PY, "tests/fake_ha_room_noise.py"]),
     ("timer-sound", [PY, "tests/fake_ha_timer_sound.py"]),
     ("sounds", [PY, "tests/fake_web_sounds.py"]),
     ("improv", [PY, "tests/fake_improv.py"]),

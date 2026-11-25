@@ -5,7 +5,7 @@ the [README](../README.md).
 
 - [Voice](#voice) · [Wake word](#wake-word) · [Several Echos](#several-echos)
 - [Buttons and light ring](#buttons-and-light-ring) · [Music](#music) · [Bluetooth proxy](#bluetooth-proxy)
-- [In Home Assistant](#in-home-assistant) · [Sound detection](#sound-detection) · [Whisper detection](#whisper-detection) · [Wi-Fi motion](#wi-fi-motion)
+- [In Home Assistant](#in-home-assistant) · [Background noise sensor](#background-noise-sensor) · [Sound detection](#sound-detection) · [Whisper detection](#whisper-detection) · [Wi-Fi motion](#wi-fi-motion)
 - [Settings page](#settings-page) · [Setting up from a phone](#setting-up-from-a-phone) · [Factory reset](#factory-reset)
 - [hassmic.conf](#hassmicconf) · [adb over Wi-Fi](#adb-over-wi-fi) · [ESPHome or Wyoming](#esphome-or-wyoming)
 
@@ -869,6 +869,7 @@ Echo announces itself again after 100 s without Home Assistant, then less and le
 | Request and reply text (off by default) | Last heard (what speech-to-text understood), Last reply (what the assistant answered). Both are cleared when a request starts, so the same request twice is still a change. Home Assistant takes at most 255 characters per state: a longer reply ends in "…". Every request and reply goes into Home Assistant's history while this is on. ESPHome only |
 | [Wi-Fi motion](#wi-fi-motion) | motion sensor, sensitivity |
 | Light sensor (off by default) | Illuminance (the room's light in lux); "LED brightness" then also follows auto brightness, an entry in the logbook every few minutes. Off, it shows only levels you set |
+| [Background noise sensor](#background-noise-sensor) (off by default) | Background noise level, relative microphone level in dBFS |
 | [Bluetooth proxy](#bluetooth-proxy) (on by default) | no entities: Home Assistant's Bluetooth scanner for this Echo |
 | Bluetooth audio from phones | Bluetooth pairing |
 | [Playing on a Bluetooth speaker](#playing-on-a-bluetooth-speaker) | Bluetooth speaker search, Play on Bluetooth speaker, Bluetooth speaker, Bluetooth speaker delay |
@@ -891,6 +892,22 @@ Echo announces itself again after 100 s without Home Assistant, then less and le
 - Bluetooth announcements and their language, the online updates channel, debug access (adb over Wi-Fi), SoC
   temperature and CPU usage.
 - "Music Assistant without pairing": off by default, so only Sendspin servers paired with the token may play.
+
+### Background noise sensor
+
+In ESPHome mode, switch on **Background noise sensor** under **Features** on the Echo's settings page to add
+**Background noise level** to Home Assistant. The sensor is off by default. Changing the setting briefly reconnects
+Home Assistant so it can refresh the device's entities. The setting is saved and included in settings exports.
+
+The sensor measures the Echo's microphone signal before speech gain and noise reduction, in **dBFS**. A less
+negative number means a louder background at that Echo. Readings are relative to the device and can vary with the
+model's microphone processing.
+
+The Echo uses the lower quartile of a rolling four-second window to filter out brief sounds. The first reading
+needs at least two seconds of eligible audio. Measurement pauses during playback, requests, calls and microphone
+mute. Home Assistant shows **unknown** until the first reading and after 30 seconds without a fresh reading. If
+the Echo disconnects, it shows **unavailable**. The Echo keeps only level summaries for this sensor, and Home
+Assistant can use the readings in history and automations.
 
 ## Kiosk Satellite on the screen
 

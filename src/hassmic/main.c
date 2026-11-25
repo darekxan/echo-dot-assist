@@ -64,6 +64,7 @@
 #include "afemeta.h"
 #include "micend.h"
 #include "micgain.h"
+#include "room_noise.h"
 #include "wordtail.h"
 #include "wakealign.h"
 #include "netaddr.h"
@@ -4187,6 +4188,25 @@ int core_own_sound(void)
            || atomic_load(&tts_on);
 }
 
+static atomic_int room_noise_on;           /* the capture thread skips the lock while the sensor is off */
+static struct room_noise room_noise;       /* core_lock held */
+
+int core_room_noise_sensor(int set)
+{
+    int enabled = atomic_load(&room_noise_on);
+    if (set >= 0 && (set != 0) != enabled) {
+        enabled = set != 0;
+        room_noise_reset(&room_noise);
+        atomic_store(&room_noise_on, enabled);
+    }
+    return enabled;
+}
+
+float core_bg_noise(void)
+{
+    return room_noise_level(&room_noise, mono_ms());
+}
+
 static void *capture_thread(void *arg)
 {
     FILE *dump = NULL;
@@ -4234,6 +4254,17 @@ static void *capture_thread(void *arg)
 
         if (core_local_wake && atomic_exchange(&wake_switch, 0)) wake_load();     /* another wake word, engine or model */
         if (core_local_wake) { ring_put(pcm, n / 2); wake_feed(pcm, n / 2); }
+        if (proto == &proto_esphome && atomic_load(&room_noise_on)) {
+            pthread_mutex_lock(&core_lock);
+            if (atomic_load(&room_noise_on)) {
+                long long now = mono_ms();
+                int eligible = !core_muted() && state == IDLE && !atomic_load(&streaming)
+                    && !core_own_sound() && !atomic_load(&music_on) && !atomic_load(&alarm_on) && call_was == CALL_IDLE
+                    && now - atomic_load(&own_sound_ms) >= 750 && now - atomic_load(&earcon_heard_until) >= 500;
+                room_noise_feed(&room_noise, pcm, (size_t)n / 2, now, eligible);
+            }
+            pthread_mutex_unlock(&core_lock);
+        }
         if (atomic_load(&sound_want) != sound_running) {           /* Home Assistant switched sound detection */
             if (!sound_running) {
                 const char *types[SOUND_MAP]; for (int i = 0; i < SOUND_MAP; i++) types[i] = sound_map[i].amazon;
